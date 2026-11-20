@@ -1,6 +1,6 @@
 # 轻量软件管理器 LiteManager
 
-一个 **约 68 KB 单文件绿色版** 的 Windows 小工具：强制卸载软件、识别疑似流氓软件、按类型批量管理和强删文件（文档 / 图片 / 视频 / 压缩包 ）、文件夹搜寻，所有列表都能点列头排序。
+一个 **约 70 KB 单文件绿色版** 的 Windows 小工具：强制卸载软件、识别疑似流氓软件、按类型批量管理和强删文件（文档 / 图片 / 视频 / 压缩包 ）、文件夹搜寻，所有列表都能点列头排序。
 
 - 单文件 exe，**不用安装**，双击就能跑，不写系统目录、不装服务、不联网
 - 无第三方依赖、无 NuGet 包，只用 .NET Framework 自带的 WinForms
@@ -26,10 +26,10 @@
 **疑似流氓软件**：多维度打分，只有你勾选并确认后才动手
 ![疑似流氓软件](screenshots/02-rogue.png)
 
-**文档管理**：Word / Excel / PPT / PDF / 文本 / 其他，全盘 1 万+ 文档，右侧「转到」直接跳转定位
+**文档管理**：Word / Excel / PPT / PDF / 文本 / 其他，全盘搜索，右侧「转到」直接跳转定位
 ![文档管理](screenshots/03-docs.png)
 
-**图片管理**：单独页签，3 万+ 图片全部显示，勾选后可批量删除或彻底删除
+**图片管理**：单独页签，全盘搜索全部显示，勾选后可批量删除或彻底删除
 ![图片管理](screenshots/04-images.png)
 
 **视频管理**：mp4 / mkv / mov / avi / flv / rmvb / webm 等
@@ -45,7 +45,7 @@
 
 ## 自己编译（不需要 Visual Studio）
 
-只用系统自带的 csc.exe，一条命令出 65 KB 的 exe：
+只用系统自带的 csc.exe，一条命令出 70 KB 的 exe：
 
 ```bat
 "C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe" /nologo /target:winexe /codepage:65001 /optimize+ ^
@@ -99,7 +99,6 @@
 ### 6. 排序与重绘细节
 - **点列头排序**：`ColumnClick` → `SortCatView` / `SortFolderView`，记录 `SortCol / SortAsc`，点同一列切换升序（▲）/ 降序（▼），箭头直接写进列头文字；
 - 虚拟列表排序不能动控件，做法是排一份**下标数组**，再按新顺序重建 `View` 和与之平行的 `Chk`（勾选状态），所以排序后勾选跟着文件走、不会串行；重新扫描完成时如果已有排序列，会自动再套一遍排序；
-- **勾选不再闪白**：以前勾一行调 `v.List.Invalidate()` 整表重画，白底一刷就是全屏闪一下。现在开启 ListView 双缓冲（反射设 `DoubleBuffered=true`），并用 `InvalidateRow()` 只让当前行的矩形失效重画（每行自绘时把区域记进 `Rects`，滚动后也能命中），空格键多选走 `InvalidateRows()` 按行区间重画。
 
 ---
 
@@ -107,7 +106,7 @@
 
 ```
 LiteManager/
-├─ bin/LiteManager.exe      # 编译好的 65 KB 成品
+├─ bin/LiteManager.exe      # 编译好的 70 KB 成品
 ├─ src/LiteManager.cs       # 全部源码（单文件）
 ├─ src/app.manifest         # requireAdministrator + dpiAware
 ├─ src/app.ico              # 图标

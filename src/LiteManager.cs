@@ -870,6 +870,52 @@ class FolderItem
     public string Name = "";
 }
 
+/// <summary>软件管理页列头点击排序用的比较器。</summary>
+class AppSorter : System.Collections.IComparer
+{
+    public int Col = 0;
+    public bool Asc = true;
+
+    static string Sub(ListViewItem it, int col)
+    {
+        return (col >= 0 && col < it.SubItems.Count) ? it.SubItems[col].Text : "";
+    }
+
+    // 注册表安装日期是 YYYYMMDD 文本，空值排最后
+    static int CmpDate(string x, string y)
+    {
+        if (x.Length == 0 && y.Length == 0) return 0;
+        if (x.Length == 0) return 1;
+        if (y.Length == 0) return -1;
+        return string.Compare(x, y, StringComparison.Ordinal);
+    }
+
+    public int Compare(object x, object y)
+    {
+        ListViewItem a = (ListViewItem)x;
+        ListViewItem b = (ListViewItem)y;
+        AppInfo ai = a.Tag as AppInfo;
+        AppInfo bi = b.Tag as AppInfo;
+        int c;
+        if (ai == null || bi == null)
+        {
+            c = string.Compare(a.Text, b.Text, StringComparison.OrdinalIgnoreCase);
+        }
+        else
+        {
+            switch (Col)
+            {
+                case 0: c = string.Compare(ai.Name, bi.Name, StringComparison.OrdinalIgnoreCase); break;
+                case 3: c = ai.SizeKB.CompareTo(bi.SizeKB); break;
+                case 4: c = CmpDate(ai.InstallDate, bi.InstallDate); break;
+                default: c = string.Compare(Sub(a, Col), Sub(b, Col), StringComparison.OrdinalIgnoreCase); break;
+            }
+            if (c == 0) c = string.Compare(ai.Name, bi.Name, StringComparison.OrdinalIgnoreCase);
+        }
+        return Asc ? c : -c;
+    }
+}
+
 class ScanResult
 {
     public List<DocItem> Files = new List<DocItem>();
@@ -1059,6 +1105,11 @@ class CatView
     public string Cat = null;
     public bool IsDocPage = false;
     public bool Dirty = true;
+    // 排序：-1 表示按扫描顺序，其它为列序号；SortAsc 为升序
+    public int SortCol = -1;
+    public bool SortAsc = true;
+    // 记录每一行最近一次自绘时的区域，用于按行精确重绘
+    public Dictionary<int, Rectangle> Rects = new Dictionary<int, Rectangle>();
 }
 
 class FolderView
@@ -1071,6 +1122,8 @@ class FolderView
     public Button Scan, OpenAll;
     public List<FolderItem> View = new List<FolderItem>();
     public bool Dirty = true;
+    public int SortCol = -1;
+    public bool SortAsc = true;
 }
 
 class MainForm : Form
@@ -1094,6 +1147,7 @@ class MainForm : Form
 
     CatView vDocs, vImages, vVideos, vArchives;
     FolderView vFolders;
+    AppSorter appSorter = new AppSorter();
 
     bool scanningDocs = false;
     volatile bool cancelDocScan = false;
@@ -1213,7 +1267,156 @@ class MainForm : Form
         g.Dispose();
         il.Images.Add(dot);
         lv.SmallImageList = il;
+        EnableDoubleBuffer(lv);
         return lv;
+    }
+
+    static void InvalidateRows(CatView v, int first, int last)
+    {
+        if (first < 0) return;
+        Rectangle a, b;
+        bool got = v.Rects.TryGetValue(first, out a) & v.Rects.TryGetValue(last, out b);
+        if (got && a.Height > 0 && b.Height > 0)
+        {
+            RepaintRows(v, Math.Min(a.Top, b.Top), Math.Max(a.Bottom, b.Bottom));
+            return;
+        }
+        try
+        {
+            a = v.List.GetItemRect(first, ItemBoundsPortion.Entire);
+            b = v.List.GetItemRect(last, ItemBoundsPortion.Entire);
+            RepaintRows(v, Math.Min(a.Top, b.Top), Math.Max(a.Bottom, b.Bottom));
+            return;
+        }
+        catch { }
+        v.List.Invalidate();
+    }
+
+    // ================== 排序 ==================
+
+    static readonly string[] DocHeaders = { "文件名", "类型", "格式", "大小", "修改时间", "完整路径", "操作" };
+
+    static int CmpDoc(DocItem a, DocItem b, int col)
+    {
+        if (a == null) return (b == null) ? 0 : -1;
+        if (b == null) return 1;
+        switch (col)
+        {
+            case 0: return string.Compare(a.Name, b.Name, StringComparison.OrdinalIgnoreCase);
+            case 1: return string.Compare(a.Cat, b.Cat, StringComparison.OrdinalIgnoreCase);
+            case 2: return string.Compare(a.Ext, b.Ext, StringComparison.OrdinalIgnoreCase);
+            case 3: return a.Size.CompareTo(b.Size);
+            case 4: return a.Modified.CompareTo(b.Modified);
+            case 5: return string.Compare(a.Path, b.Path, StringComparison.OrdinalIgnoreCase);
+            default: return 0;
+        }
+    }
+
+    void UpdateDocHeaders(CatView v)
+    {
+        for (int i = 0; i < v.List.Columns.Count && i < DocHeaders.Length; i++)
+        {
+            string t = DocHeaders[i];
+            if (i == v.SortCol) t += v.SortAsc ? " ▲" : " ▼";
+            v.List.Columns[i].Text = t;
+        }
+    }
+
+    void SortCatView(CatView v, int col)
+    {
+        if (col < 0 || col > 5) return;                       // 操作列不参与排序
+        if (v.SortCol == col) v.SortAsc = !v.SortAsc;
+        else { v.SortCol = col; v.SortAsc = true; }
+        ApplyCatSort(v);
+    }
+
+    /// <summary>按 v.SortCol / v.SortAsc 重排 View，并同步勾选状态。</summary>
+    void ApplyCatSort(CatView v)
+    {
+        if (v.SortCol < 0 || v.View.Count == 0) { UpdateDocHeaders(v); return; }
+
+        int col = v.SortCol;
+        bool asc = v.SortAsc;
+        List<int> order = new List<int>(v.View.Count);
+        for (int i = 0; i < v.View.Count; i++) order.Add(i);
+        order.Sort(delegate (int x, int y)
+        {
+            int c = CmpDoc(v.View[x], v.View[y], col);
+            if (c == 0 && col != 0) c = CmpDoc(v.View[x], v.View[y], 0);
+            return asc ? c : -c;
+        });
+
+        List<DocItem> nv = new List<DocItem>(order.Count);
+        List<bool> nc = new List<bool>(order.Count);
+        for (int k = 0; k < order.Count; k++)
+        {
+            nv.Add(v.View[order[k]]);
+            nc.Add(k < v.Chk.Count ? v.Chk[order[k]] : false);
+        }
+        v.View = nv;
+        v.Chk = nc;
+        v.Rects.Clear();
+        v.List.VirtualListSize = 0;
+        v.List.VirtualListSize = v.View.Count;
+        v.List.Invalidate();
+        UpdateDocHeaders(v);
+    }
+
+    void SortFolderView(FolderView f, int col)
+    {
+        if (col < 0 || col > 1) return;
+        if (f.SortCol == col) f.SortAsc = !f.SortAsc;
+        else { f.SortCol = col; f.SortAsc = true; }
+        ApplyFolderSort(f);
+    }
+
+    void ApplyFolderSort(FolderView f)
+    {
+        if (f.SortCol < 0 || f.View.Count == 0) { UpdateFolderHeaders(f); return; }
+
+        int col = f.SortCol;
+        bool asc = f.SortAsc;
+        List<int> order = new List<int>(f.View.Count);
+        for (int i = 0; i < f.View.Count; i++) order.Add(i);
+        order.Sort(delegate (int x, int y)
+        {
+            int c;
+            if (col == 0) c = string.Compare(f.View[x].Name, f.View[y].Name, StringComparison.OrdinalIgnoreCase);
+            else c = string.Compare(f.View[x].Path, f.View[y].Path, StringComparison.OrdinalIgnoreCase);
+            if (c == 0 && col != 0) c = string.Compare(f.View[x].Name, f.View[y].Name, StringComparison.OrdinalIgnoreCase);
+            return asc ? c : -c;
+        });
+
+        List<FolderItem> nv = new List<FolderItem>(order.Count);
+        for (int k = 0; k < order.Count; k++) nv.Add(f.View[order[k]]);
+        f.View = nv;
+        f.List.VirtualListSize = 0;
+        f.List.VirtualListSize = f.View.Count;
+        f.List.Invalidate();
+        UpdateFolderHeaders(f);
+    }
+
+    void UpdateFolderHeaders(FolderView f)
+    {
+        string[] baseNames = { "文件夹名", "完整路径", "操作" };
+        for (int i = 0; i < f.List.Columns.Count && i < baseNames.Length; i++)
+        {
+            string t = baseNames[i];
+            if (i == f.SortCol) t += f.SortAsc ? " ▲" : " ▼";
+            f.List.Columns[i].Text = t;
+        }
+    }
+
+    static readonly string[] AppHeaders = { "软件名称", "版本", "发布者", "大小", "安装日期", "安装位置", "状态" };
+
+    void UpdateAppHeaders()
+    {
+        for (int i = 0; i < lvApps.Columns.Count && i < AppHeaders.Length; i++)
+        {
+            string t = AppHeaders[i];
+            if (i == appSorter.Col) t += appSorter.Asc ? " ▲" : " ▼";
+            lvApps.Columns[i].Text = t;
+        }
     }
 
     static Panel MkTop()
@@ -1326,6 +1529,15 @@ class MainForm : Form
         lvApps.Columns.Add("状态", 96);
         lvApps.DoubleClick += delegate { OpenLocationOf(lvApps); };
         lvApps.KeyDown += delegate (object s, KeyEventArgs e) { if (e.KeyCode == Keys.Delete) UninstallSelectedApps(lvApps); };
+        lvApps.ColumnClick += delegate (object s, ColumnClickEventArgs e)
+        {
+            if (e.Column < 0 || e.Column > 6) return;
+            if (appSorter.Col == e.Column) appSorter.Asc = !appSorter.Asc;
+            else { appSorter.Col = e.Column; appSorter.Asc = true; }
+            lvApps.ListViewItemSorter = appSorter;
+            lvApps.Sort();
+            UpdateAppHeaders();
+        };
         pageApps.Controls.Add(lvApps);
         pageApps.Controls.Add(top1);
 
@@ -1474,7 +1686,42 @@ class MainForm : Form
     {
         if (i < 0 || i >= v.Chk.Count) return;
         v.Chk[i] = !v.Chk[i];
+        InvalidateRow(v, i);
+    }
+
+    static void EnableDoubleBuffer(Control c)
+    {
+        try
+        {
+            System.Reflection.PropertyInfo pi = typeof(Control).GetProperty("DoubleBuffered",
+                System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic);
+            if (pi != null) pi.SetValue(c, true, null);
+        }
+        catch { }
+    }
+
+    /// <summary>只重画这一行，避免整表闪白。</summary>
+    static void InvalidateRow(CatView v, int i)
+    {
+        Rectangle r;
+        if (v.Rects.TryGetValue(i, out r) && r.Height > 0) { RepaintRows(v, r.Top, r.Bottom); return; }
+        try
+        {
+            r = v.List.GetItemRect(i, ItemBoundsPortion.Entire);
+            if (r.Height > 0) { RepaintRows(v, r.Top, r.Bottom); return; }
+        }
+        catch { }
         v.List.Invalidate();
+    }
+
+    static void RepaintRows(CatView v, int top, int bottom)
+    {
+        int left = 0;
+        int width = v.List.ClientSize.Width;
+        int t = Math.Max(0, top);
+        int b = Math.Min(v.List.ClientSize.Height, bottom);
+        if (b - t <= 0) return;
+        v.List.Invalidate(new Rectangle(left, t, width, b - t));
     }
 
     static void DrawCheck(Graphics g, Rectangle cell, bool on)
@@ -1525,6 +1772,7 @@ class MainForm : Form
         DocItem d = GetDoc(v, idx);
         bool sel = v.List.SelectedIndices.Contains(idx);
         Rectangle row = e.Bounds;
+        if (row.Height > 0) v.Rects[idx] = row;
         Graphics g = e.Graphics;
         using (SolidBrush b = new SolidBrush(sel ? SystemColors.Highlight : Color.White)) g.FillRectangle(b, row);
         Color fg = sel ? SystemColors.HighlightText : Color.Black;
@@ -1578,6 +1826,7 @@ class MainForm : Form
         v.List.DrawColumnHeader += delegate (object s, DrawListViewColumnHeaderEventArgs e) { e.DrawDefault = true; };
         v.List.DrawItem += delegate (object s, DrawListViewItemEventArgs e) { DrawDocRow(v, e); };
         v.List.DrawSubItem += delegate (object s, DrawListViewSubItemEventArgs e) { };
+        v.List.ColumnClick += delegate (object s, ColumnClickEventArgs e) { SortCatView(v, e.Column); };
 
         v.List.MouseDown += delegate (object s, MouseEventArgs e)
         {
@@ -1608,12 +1857,15 @@ class MainForm : Form
             else if (e.KeyCode == Keys.Enter) OpenDocLocation(v);
             else if (e.KeyCode == Keys.Space)
             {
+                int first = -1, last = -1;
                 for (int k = 0; k < v.List.SelectedIndices.Count; k++)
                 {
                     int idx = v.List.SelectedIndices[k];
                     if (idx < v.Chk.Count) v.Chk[idx] = !v.Chk[idx];
+                    if (first < 0 || idx < first) first = idx;
+                    if (idx > last) last = idx;
                 }
-                v.List.Invalidate();
+                InvalidateRows(v, first, last);
                 e.Handled = true;
             }
         };
@@ -1670,6 +1922,7 @@ class MainForm : Form
 
         f.List.OwnerDraw = true;
         f.List.DrawColumnHeader += delegate (object s, DrawListViewColumnHeaderEventArgs e) { e.DrawDefault = true; };
+        f.List.ColumnClick += delegate (object s, ColumnClickEventArgs e) { SortFolderView(f, e.Column); };
         f.List.DrawItem += delegate (object s, DrawListViewItemEventArgs e)
         {
             int idx = e.ItemIndex;
@@ -1927,6 +2180,7 @@ class MainForm : Form
             matched++;
         }
         lvApps.EndUpdate();
+        if (lvApps.ListViewItemSorter != null) { lvApps.Sort(); UpdateAppHeaders(); }
 
         if (kw.Length > 0) lblAppState.Text = "匹配 " + matched + " 个 / 共 " + apps.Count + " 个";
         else lblAppState.Text = "已安装 " + apps.Count + " 个软件";
@@ -2100,7 +2354,8 @@ class MainForm : Form
 
         v.List.VirtualListSize = 0;
         v.List.VirtualListSize = v.View.Count;
-        v.List.Invalidate();
+        v.Rects.Clear();
+        if (v.SortCol >= 0) ApplyCatSort(v); else { v.List.Invalidate(); UpdateDocHeaders(v); }
 
         string sizeText = (totalBytes / 1024.0 / 1024.0).ToString("0.0") + " MB";
         v.State.Text = "共 " + totalMatch + " 个 · " + sizeText;
@@ -2122,7 +2377,7 @@ class MainForm : Form
 
         f.List.VirtualListSize = 0;
         f.List.VirtualListSize = f.View.Count;
-        f.List.Invalidate();
+        if (f.SortCol >= 0) ApplyFolderSort(f); else { f.List.Invalidate(); UpdateFolderHeaders(f); }
 
         f.State.Text = "共 " + f.View.Count + " 个文件夹";
         f.Dirty = false;
@@ -2132,6 +2387,7 @@ class MainForm : Form
     {
         v.View.Clear();
         v.Chk.Clear();
+        v.Rects.Clear();
         v.List.VirtualListSize = 0;
         v.List.Invalidate();
         v.Dirty = true;

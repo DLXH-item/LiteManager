@@ -486,29 +486,76 @@ static class Uninstaller
         finally { try { if (sh != null) Marshal.ReleaseComObject(sh); } catch { } }
     }
 
-    // 删快捷方式：文件名命中 → 目标在安装目录下 → 目标 exe 名命中，三重判定
+    // 快捷方式名与软件名的匹配：去空格后双向包含（中文 2 字名如「豆包」「微信」也能命中）
+    static bool ScNameHit(string fnLower, string lc)
+    {
+        string a = Regex.Replace(fnLower, @"\s+", "");
+        string b = Regex.Replace(lc, @"\s+", "");
+        if (a.Length < 2 || b.Length < 2) return false;
+        if (a.Contains(b)) return true;
+        if (b.Contains(a) && a.Length >= 3) return true;
+        return false;
+    }
+
+    static void CollectShortcuts(string dir, int depth, List<string> found)
+    {
+        if (depth > 8) return;
+        string[] files = null;
+        try { files = Directory.GetFiles(dir); } catch { }
+        if (files != null)
+        {
+            for (int i = 0; i < files.Length; i++)
+            {
+                string ext = Path.GetExtension(files[i]).ToLower();
+                if (ext == ".lnk" || ext == ".url") found.Add(files[i]);
+            }
+        }
+        string[] subs = null;
+        try { subs = Directory.GetDirectories(dir); } catch { }
+        if (subs == null) return;
+        for (int i = 0; i < subs.Length; i++)
+        {
+            try
+            {
+                FileAttributes fa = File.GetAttributes(subs[i]);
+                if ((fa & FileAttributes.ReparsePoint) != 0) continue;
+            }
+            catch { continue; }
+            CollectShortcuts(subs[i], depth + 1, found);
+        }
+    }
+
+    // 删快捷方式：文件名命中 → 目标在安装目录下 → 目标文件名命中，三重判定
     static void DeleteShortcuts(string name, string installDir)
     {
+        DeleteShortcuts(name, installDir, null);
+    }
+
+    static void DeleteShortcuts(string name, string installDir, Action<string> log)
+    {
         string clean = (name == null ? "" : name.Trim());
-        if (clean.Length < 3) return;
-        string lc = clean.ToLower();
         string dir = (installDir == null ? "" : installDir.Trim().Trim('"').TrimEnd('\\'));
         if (dir.Length < 6) dir = "";
+        if (clean.Length < 2 && dir.Length == 0) return;
+        string lc = clean.ToLower();
         string dl = dir.ToLower();
 
         string[] roots = ShortcutRoots();
+        List<string> seen = new List<string>();
+        int deleted = 0;
         for (int i = 0; i < roots.Length; i++)
         {
             string root = roots[i];
             if (!Directory.Exists(root)) continue;
-            string[] lnks = null;
-            try { lnks = Directory.GetFiles(root, "*.lnk", System.IO.SearchOption.AllDirectories); } catch { }
-            if (lnks == null) continue;
-            for (int j = 0; j < lnks.Length; j++)
+            List<string> lnks = new List<string>();
+            CollectShortcuts(root, 0, lnks);
+            for (int j = 0; j < lnks.Count; j++)
             {
                 string l = lnks[j];
+                if (seen.Contains(l)) continue;
+                seen.Add(l);
                 string fn = Path.GetFileNameWithoutExtension(l).ToLower();
-                bool hit = fn.Contains(lc);
+                bool hit = (lc.Length >= 2) && ScNameHit(fn, lc);
 
                 if (!hit)
                 {
@@ -520,35 +567,61 @@ static class Uninstaller
                         else
                         {
                             string tn = Path.GetFileNameWithoutExtension(tgt).ToLower();
-                            if (tn.Length >= 3 && tn.Contains(lc)) hit = true;
+                            if (lc.Length >= 2 && ScNameHit(tn, lc)) hit = true;
                         }
                     }
                 }
 
                 if (!hit) continue;
-                try { FileForce.DeleteFile(l, false, null); } catch { }
+                try
+                {
+                    if (FileForce.DeleteFile(l, false, null))
+                    {
+                        deleted++;
+                        if (log != null) log("· 删除快捷方式 " + Path.GetFileName(l));
+                    }
+                }
+                catch { }
             }
         }
 
-        // 清掉开始菜单里被删空的应用文件夹（如「豆包」整个目录）
+        // 清掉被删空的应用文件夹（如开始菜单里的「豆包」目录）
         for (int i = 0; i < roots.Length; i++)
         {
             string root = roots[i];
             if (!Directory.Exists(root)) continue;
-            string[] subs = null;
-            try { subs = Directory.GetDirectories(root, "*", System.IO.SearchOption.AllDirectories); } catch { }
-            if (subs == null) continue;
-            Array.Sort(subs, delegate (string x, string y) { return y.Length - x.Length; });
-            for (int j = 0; j < subs.Length; j++)
+            List<string> subs = new List<string>();
+            CollectDirs(root, 0, subs);
+            subs.Sort(delegate (string x, string y) { return y.Length - x.Length; });
+            for (int j = 0; j < subs.Count; j++)
             {
                 string sn = Path.GetFileName(subs[j]).ToLower();
-                if (!sn.Contains(lc)) continue;
+                if (lc.Length < 2 || !ScNameHit(sn, lc)) continue;
                 try
                 {
                     if (Directory.GetFileSystemEntries(subs[j]).Length == 0) Directory.Delete(subs[j], false);
                 }
                 catch { }
             }
+        }
+        if (deleted > 0 && log != null) log("· 共删除 " + deleted + " 个快捷方式");
+    }
+
+    static void CollectDirs(string dir, int depth, List<string> found)
+    {
+        if (depth > 8) return;
+        string[] subs = null;
+        try { subs = Directory.GetDirectories(dir); } catch { return; }
+        for (int i = 0; i < subs.Length; i++)
+        {
+            found.Add(subs[i]);
+            try
+            {
+                FileAttributes fa = File.GetAttributes(subs[i]);
+                if ((fa & FileAttributes.ReparsePoint) != 0) continue;
+            }
+            catch { continue; }
+            CollectDirs(subs[i], depth + 1, found);
         }
     }
 
@@ -672,7 +745,7 @@ static class Uninstaller
             }
         }
 
-        DeleteShortcuts(a.Name, dir);
+        DeleteShortcuts(a.Name, dir, log);
         DeleteAppDataLeftovers(a);
 
         try
@@ -1522,6 +1595,7 @@ static class Uninstaller
         DcCleanRegistry(tokens, log);
         DcCleanRun(tokens, dirs.ToArray(), log);
         DcCleanStartupLnk(tokens, log);
+        if (!a.Protected) DeleteShortcuts(a.Name, dirs.Count > 0 ? dirs[0] : "", log);
         if (!a.Protected && tokens.Count > 0)
         {
             DcCleanTempFiles(tokens, log);

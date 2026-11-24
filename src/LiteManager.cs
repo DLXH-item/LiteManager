@@ -414,31 +414,141 @@ static class Uninstaller
 
     static void DeleteShortcuts(string name)
     {
-        string clean = name.Trim();
-        if (clean.Length < 3) return;
-        List<string> roots = new List<string>();
-        try { roots.Add(Environment.GetFolderPath(Environment.SpecialFolder.Programs)); } catch { }
-        try { roots.Add(Environment.GetFolderPath(Environment.SpecialFolder.CommonPrograms)); } catch { }
-        try { roots.Add(Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory)); } catch { }
-        try { roots.Add(Environment.GetFolderPath(Environment.SpecialFolder.CommonDesktopDirectory)); } catch { }
-        try { roots.Add(Environment.GetFolderPath(Environment.SpecialFolder.StartMenu)); } catch { }
+        DeleteShortcuts(name, null);
+    }
 
-        foreach (string root in roots)
+    static void AddShortcutRoot(List<string> roots, Environment.SpecialFolder f)
+    {
+        try
         {
-            if (!Directory.Exists(root)) continue;
+            string p = Environment.GetFolderPath(f);
+            if (!string.IsNullOrEmpty(p) && p.Length > 3 && Directory.Exists(p) && !roots.Contains(p)) roots.Add(p);
+        }
+        catch { }
+    }
+
+    // 快捷方式可能出现的位置：开始菜单/桌面（用户 + 公共）、启动、快速启动、固定到任务栏/开始屏幕
+    static string[] ShortcutRoots()
+    {
+        List<string> r = new List<string>();
+        AddShortcutRoot(r, Environment.SpecialFolder.Programs);
+        AddShortcutRoot(r, Environment.SpecialFolder.CommonPrograms);
+        AddShortcutRoot(r, Environment.SpecialFolder.DesktopDirectory);
+        AddShortcutRoot(r, Environment.SpecialFolder.CommonDesktopDirectory);
+        AddShortcutRoot(r, Environment.SpecialFolder.StartMenu);
+        AddShortcutRoot(r, Environment.SpecialFolder.CommonStartMenu);
+        AddShortcutRoot(r, Environment.SpecialFolder.Startup);
+        AddShortcutRoot(r, Environment.SpecialFolder.CommonStartup);
+        try
+        {
+            string ad = Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData);
+            if (!string.IsNullOrEmpty(ad))
+            {
+                string q = Path.Combine(ad, @"Microsoft\Internet Explorer\Quick Launch");
+                if (Directory.Exists(q) && !r.Contains(q)) r.Add(q);
+                string tb = Path.Combine(q, @"User Pinned\TaskBar");
+                if (Directory.Exists(tb) && !r.Contains(tb)) r.Add(tb);
+                string sm = Path.Combine(q, @"User Pinned\StartMenu");
+                if (Directory.Exists(sm) && !r.Contains(sm)) r.Add(sm);
+                string wsm = Path.Combine(ad, @"Microsoft\Windows\Start Menu");
+                if (Directory.Exists(wsm) && !r.Contains(wsm)) r.Add(wsm);
+            }
+            string pd = Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData);
+            if (!string.IsNullOrEmpty(pd))
+            {
+                string w = Path.Combine(pd, @"Microsoft\Windows\Start Menu");
+                if (Directory.Exists(w) && !r.Contains(w)) r.Add(w);
+            }
+        }
+        catch { }
+        return r.ToArray();
+    }
+
+    // 解析 .lnk 指向的目标（WScript.Shell，失败返回空串）
+    public static string LnkTarget(string lnk)
+    {
+        object sh = null;
+        try
+        {
+            Type t = Type.GetTypeFromProgID("WScript.Shell");
+            if (t == null) return "";
+            sh = Activator.CreateInstance(t);
+            object sc = t.InvokeMember("CreateShortcut", System.Reflection.BindingFlags.InvokeMethod, null, sh, new object[] { lnk });
+            if (sc == null) return "";
             try
             {
-                string[] lnks = Directory.GetFiles(root, "*.lnk", System.IO.SearchOption.AllDirectories);
-                foreach (string l in lnks)
+                object tp = sc.GetType().InvokeMember("TargetPath", System.Reflection.BindingFlags.GetProperty, null, sc, null);
+                return tp == null ? "" : tp.ToString();
+            }
+            finally { try { Marshal.ReleaseComObject(sc); } catch { } }
+        }
+        catch { return ""; }
+        finally { try { if (sh != null) Marshal.ReleaseComObject(sh); } catch { } }
+    }
+
+    // 删快捷方式：文件名命中 → 目标在安装目录下 → 目标 exe 名命中，三重判定
+    static void DeleteShortcuts(string name, string installDir)
+    {
+        string clean = (name == null ? "" : name.Trim());
+        if (clean.Length < 3) return;
+        string lc = clean.ToLower();
+        string dir = (installDir == null ? "" : installDir.Trim().Trim('"').TrimEnd('\\'));
+        if (dir.Length < 6) dir = "";
+        string dl = dir.ToLower();
+
+        string[] roots = ShortcutRoots();
+        for (int i = 0; i < roots.Length; i++)
+        {
+            string root = roots[i];
+            if (!Directory.Exists(root)) continue;
+            string[] lnks = null;
+            try { lnks = Directory.GetFiles(root, "*.lnk", System.IO.SearchOption.AllDirectories); } catch { }
+            if (lnks == null) continue;
+            for (int j = 0; j < lnks.Length; j++)
+            {
+                string l = lnks[j];
+                string fn = Path.GetFileNameWithoutExtension(l).ToLower();
+                bool hit = fn.Contains(lc);
+
+                if (!hit)
                 {
-                    string fn = Path.GetFileNameWithoutExtension(l);
-                    if (fn.ToLower().Contains(clean.ToLower()))
+                    string tgt = LnkTarget(l);
+                    if (tgt.Length > 0)
                     {
-                        try { File.Delete(l); } catch { }
+                        string tl = tgt.ToLower();
+                        if (dl.Length > 0 && (tl.StartsWith(dl + "\\") || tl == dl)) hit = true;
+                        else
+                        {
+                            string tn = Path.GetFileNameWithoutExtension(tgt).ToLower();
+                            if (tn.Length >= 3 && tn.Contains(lc)) hit = true;
+                        }
                     }
                 }
+
+                if (!hit) continue;
+                try { FileForce.DeleteFile(l, false, null); } catch { }
             }
-            catch { }
+        }
+
+        // 清掉开始菜单里被删空的应用文件夹（如「豆包」整个目录）
+        for (int i = 0; i < roots.Length; i++)
+        {
+            string root = roots[i];
+            if (!Directory.Exists(root)) continue;
+            string[] subs = null;
+            try { subs = Directory.GetDirectories(root, "*", System.IO.SearchOption.AllDirectories); } catch { }
+            if (subs == null) continue;
+            Array.Sort(subs, delegate (string x, string y) { return y.Length - x.Length; });
+            for (int j = 0; j < subs.Length; j++)
+            {
+                string sn = Path.GetFileName(subs[j]).ToLower();
+                if (!sn.Contains(lc)) continue;
+                try
+                {
+                    if (Directory.GetFileSystemEntries(subs[j]).Length == 0) Directory.Delete(subs[j], false);
+                }
+                catch { }
+            }
         }
     }
 
@@ -562,7 +672,7 @@ static class Uninstaller
             }
         }
 
-        DeleteShortcuts(a.Name);
+        DeleteShortcuts(a.Name, dir);
         DeleteAppDataLeftovers(a);
 
         try
@@ -2140,6 +2250,8 @@ class MainForm : Form
 
     Label lblAppState = new Label();
     Label lblRogueState = new Label();
+    Label lblWait = new Label();
+    Label lblWait2 = new Label();
 
     Button btnAppRefresh, btnAppAll, btnAppNone, btnAppUninstall;
     Button btnRogueRefresh, btnRogueUninstall;
@@ -2221,6 +2333,20 @@ class MainForm : Form
         l.TextAlign = ContentAlignment.MiddleRight;
         l.ForeColor = Color.FromArgb(98, 104, 112);
         l.Text = "";
+        return l;
+    }
+
+    static Label MkWait()
+    {
+        Label l = new Label();
+        l.AutoSize = false;
+        l.Width = 132;
+        l.Height = 20;
+        l.TextAlign = ContentAlignment.MiddleLeft;
+        l.ForeColor = Color.FromArgb(0, 120, 212);
+        l.Font = new Font(l.Font, FontStyle.Bold);
+        l.Text = "删除中…请耐心等待";
+        l.Visible = false;
         return l;
     }
 
@@ -2513,6 +2639,9 @@ class MainForm : Form
         prgApps = MkProgress(120);
         prgApps.Location = new Point(618, 15);
 
+        lblWait = MkWait();
+        lblWait.Location = new Point(742, 11);
+
         top1.Controls.Add(MkSearchLabel());
         top1.Controls.Add(tbSearch);
         top1.Controls.Add(btnAppRefresh);
@@ -2520,6 +2649,7 @@ class MainForm : Form
         top1.Controls.Add(btnAppAll);
         top1.Controls.Add(btnAppNone);
         top1.Controls.Add(prgApps);
+        top1.Controls.Add(lblWait);
         top1.Controls.Add(lblAppState);
 
         lvApps = MkList();
@@ -2570,10 +2700,14 @@ class MainForm : Form
         prgRogue = MkProgress(120);
         prgRogue.Location = new Point(380, 15);
 
+        lblWait2 = MkWait();
+        lblWait2.Location = new Point(504, 11);
+
         top2.Controls.Add(btnRogueRefresh);
         top2.Controls.Add(btnRogueUninstall);
         top2.Controls.Add(chkHigh);
         top2.Controls.Add(prgRogue);
+        top2.Controls.Add(lblWait2);
         top2.Controls.Add(lblRogueState);
 
         lvRogue = MkList();
@@ -3264,6 +3398,8 @@ class MainForm : Form
         prgRogue.Visible = true;
         lblAppState.Text = "正在卸载 0/" + sel.Count + " …";
         lblRogueState.Text = "正在卸载…";
+        lblWait.Visible = true;
+        lblWait2.Visible = true;
 
         Task.Run(delegate
         {
@@ -3320,6 +3456,8 @@ class MainForm : Form
                     SetProgress(prgRogue, 100);
                     prgApps.Visible = false;
                     prgRogue.Visible = false;
+                    lblWait.Visible = false;
+                    lblWait2.Visible = false;
                     lblAppState.Text = "已安装 " + apps.Count + " 个软件";
                     StringBuilder sb = new StringBuilder();
                     sb.AppendLine("卸载处理完成（" + sel.Count + " 个）：");

@@ -102,25 +102,7 @@
 - **点列头排序**：`ColumnClick` → `SortCatView` / `SortFolderView`，记录 `SortCol / SortAsc`，点同一列切换升序（▲）/ 降序（▼），箭头直接写进列头文字；
 - 虚拟列表排序不能动控件，做法是排一份**下标数组**，再按新顺序重建 `View` 和与之平行的 `Chk`（勾选状态），所以排序后勾选跟着文件走、不会串行；重新扫描完成时如果已有排序列，会自动再套一遍排序；
 
-### 7. 深度残留清理 —— `Uninstaller.DeepClean`
-卸载程序跑完后还会「卸不干净」，所以 v1.8 加了一层自己的清理器，v1.9、v2.0 又做了两轮补强。逻辑是**先算关键词，再按关键词找目标，最后逐项强删并校验**：
 
-- **关键词**（v1.9 扩充）：软件显示名剥掉括号、版本号、`64-bit / x64` 后得到主名；再加上 **注册表卸载键名**（`...\Uninstall\Doubao` → `Doubao`）、安装目录名、**卸载程序所在目录**、**图标路径**、静默卸载程序目录，以及名称里 ≥5 字符的分词。这一条解决了「中文显示名 + 英文目录」的经典错配（显示 `豆包`、数据目录叫 `Doubao`）。短于 2 字符、命中 `setup / app / client / temp` 等通用词、`{GUID}`、纯十六进制串一律丢弃。
-- **目录匹配**（`DcHit`）：同名即命中；比关键词长时，要求关键词后紧跟分隔符（`空格 - _ . ( [ +`）、数字（`AppName70`）、已知后缀（`cache / data / temp / log / config / updater / webview / crash / app / link / router / htm / pdf ...`）或**驼峰附属组件**（`DoubaoLinkRouter` 这种「关键词 + 大写词根且 ≥6 字符」）。反过来 `AppNameOther`、`AppName2` 这类不同产品不会命中。
-- **扫描范围**（v1.9 扩充）：`%LocalAppData%`、`%AppData%`、`%LocalLow%`、`%ProgramData%`、`Temp`、`Programs`、`Packages`，外加 **`C:\Users\<用户名>` 根目录**和「文档」目录下软件自建的数据目录（`C:\Users\xxx\Doubao` 就是这类）。厂商目录（`Tencent`、`Adobe`）**只删里面同名的子目录**，不端整棵厂商树；删完再把变空的厂商目录 `DcPruneEmpty` 顺手清掉。
-- **联接点保护**：`C:\Users` 下的 `Application Data`、`Local Settings`、`My Documents` 等是 reparse point，扫描时全部跳过（`DcIsLink` 检查 `FileAttributes.ReparsePoint`），避免顺着联接点删到 `AppData` 里面。
-- **注册表**（v1.9 扩充）：`HKCU / HKLM` 的 `Software`、`Software\WOW6432Node` **和 `Software\Classes`**（协议处理器 `doubao://`、右键菜单、文件关联残留都在这里）下同名键、厂商键内同名子键整棵删除；本次删过的父键如果变成空壳，再 `DcPruneEmptyReg` 补一刀；卸载项本身也会重复删一次（幂等）。
-- **开机启动**：`Run / RunOnce`（含 WOW6432Node）里名称命中或数据指向安装目录的值删掉，启动文件夹里的同名 `.lnk` 也删。
-- **系统服务**（v1.9 修正）：遍历 `HKLM\SYSTEM\CurrentControlSet\Services`，只认 **`ImagePath` 以「安装目录\」开头**的服务；没有安装目录时，必须 **服务名和可执行文件名同时命中关键词** 才动手。原来的「包含匹配」会把 `C:\Program Files` 里所有服务一网打尽，v1.9 已修掉。
-- **计划任务**：递归读 `C:\Windows\System32\Tasks` 下的任务文件，内容里出现安装目录的，用 `schtasks /delete /tn <相对名> /f` 删掉。
-- **进程**：`KillIn(dir)` 杀掉可执行文件在目标目录内的进程；再加一层 `DcKillByName`，按进程名匹配关键词结束常驻进程（跳过 `explorer / svchost / lsass` 等系统进程、跳过本程序自身），解决「安装目录登记为空、进程却在跑」的情况。
-- **临时文件**：`%TEMP%` 下与关键词同名 / 同前缀的文件（`Doubao-1234.log`）一并清掉。
-- **锁文件**（v2.0 新增）：`%AppData%`、`%LocalAppData%`、`%LocalLow%`、`%ProgramData%`、`%TEMP%`、`C:\Users\<用户名>` 下（含一级、二级子目录）扫 `*.lock / *.lck / *.lockfile / *.lckfile`，文件名命中关键词就删；删不掉时先杀占用进程，再走「关闭即删除」「改名再删」，最后登记重启删除。
-- **占用/无权限文件**（v2.0 新增）：目录树里任何一个文件删不掉，都不会直接放弃——单文件梯度从 Restart Manager 杀进程、takeown/icacls 接管，到独占句柄删除、改名删除，最后 `PendingFileRenameOperations` 重启删除，日志里明确写「已登记重启后自动删除」。
-- **安全阀 `DcSafeDir`**：`C:\`、`C:\Windows`、`Program Files`、`ProgramData`、`AppData`、用户目录本体、`Desktop / Documents / Downloads` 这些路径永远判为「不可删」；安装目录若被软件登记成公共目录，删除与服务/任务匹配全部跳过——以前这一条会把整个 `Program Files` 当安装目录删掉，v1.9 已修掉。
-- **重试与校验**：删除失败不是直接放弃——`KillIn` 杀占用进程、`DeleteDir` 强删，最多重试 3 轮，仍失败会写进「卸载结果」对话框，提示重启后重试；最后再扫一遍目标列表，确认真的不存在了才算完成。
-
----
 
 ## 目录说明
 
@@ -136,21 +118,6 @@ LiteManager/
 
 ## 更新日志
 
-- **v2.0**：锁文件 / 被占用 / 无权限文件「必须删掉」专项
-  - `FileForce` 删除梯度再加两级：`FILE_FLAG_DELETE_ON_CLOSE` 独占句柄删除 → 改名 `~lm_del_xxx` 后删除
-  - 兜底新增 `MoveFileEx(MOVEFILE_DELAY_UNTIL_REBOOT)`：真正删不掉的（独占句柄）登记进系统 `PendingFileRenameOperations`，**开机时系统在加载进程之前自动清除**，日志标注「已登记重启后删除」
-  - 目录树删完仍有残留时走 `PendTree`：树内每个文件/空目录逐项登记重启删除，不再出现「删了一半就报失败」
-  - 新增 `DcCleanLocks`：在 `AppData / LocalLow / ProgramData / TEMP / 用户根`（深度 2 层）扫 `*.lock / *.lck / *.lockfile / *.lckfile`，命中关键词的锁文件直接删，删不掉同样走杀进程 → 独占句柄 → 重启删除
-  - `Uninstaller` 日志区分「已删除」与「已清理（残留登记重启后删除）」，并汇总登记项数量，不再出现假成功
-- **v1.9**：深度清理全量加强 + 三处隐性 bug 修复
-  - 关键词新增「注册表卸载键名 / 卸载程序目录 / 图标路径」，修掉「显示名是中文、数据目录是英文」的软件清不干净的问题（例：`豆包` 的数据目录 `C:\Users\xxx\Doubao` 以前完全匹配不到）
-  - 扫描范围新增 `C:\Users\<用户名>` 根目录与「文档」下的软件数据目录，并跳过 `Application Data` / `Local Settings` 这类联接点
-  - 注册表新增 `Software\Classes`（协议处理器、右键菜单、文件关联）；卸载项本身幂等重删
-  - 新增按进程名结束常驻进程（跳过系统进程与本程序自身）、`%TEMP%` 同名临时文件清理
-  - **修复**：安装目录被登记成 `C:\Program Files` 时会把它当普通目录整个删掉 → 新增 `DcSafeDir` 安全阀
-  - **修复**：服务匹配用「包含」判定，安装目录一宽泛就会误删一堆无关服务（曾把 Edge / NVIDIA / Steam 的服务全列进删除名单）→ 改为「ImagePath 必须在安装目录之下」，且按 exe 名判断时要求服务名也命中
-  - **修复**：`Uninstaller.Run` 只看进程是否退出、不看退出码，`sc delete` 失败也显示成功 → 改为按 ExitCode 判定
-- **v1.8**：强制卸载后新增「深度残留清理」——安装目录（含占用文件重试）、`%AppData%` 系列缓存（同名 / 同名前缀 / 厂商目录内同名子目录 + 空厂商目录回收）、`Software` 下同名注册表键与空壳父键、`Run/RunOnce` 启动项与启动文件夹快捷方式、指向安装目录的系统服务（`sc delete`）、引用安装目录的计划任务（`schtasks /delete`），删完逐项校验并把失败项列进结果框
 - 勾选复选框不再整表刷新闪白（双缓冲 + 按行局部重绘）
 - 六个页面支持点列头排序（▲升序 / ▼降序）——软件管理按 名称 / 版本 / 发布者 / 大小 / 安装日期 / 安装位置 / 状态；文档、图片、视频、压缩文件按 文件名 / 类型 / 格式 / 大小 / 修改时间 / 完整路径；文件夹按 文件夹名 / 完整路径。排序后勾选状态跟随文件
 

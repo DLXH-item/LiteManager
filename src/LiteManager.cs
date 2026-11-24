@@ -333,7 +333,9 @@ static class Uninstaller
             Process p = Process.Start(psi);
             if (p == null) return false;
             bool exited = p.WaitForExit(timeoutMs);
-            return exited;
+            if (!exited) return false;
+            try { return p.ExitCode == 0; }
+            catch { return false; }
         }
         catch { return false; }
     }
@@ -546,9 +548,9 @@ static class Uninstaller
         // 3) 强制清理
         if (!string.IsNullOrEmpty(dir) && Directory.Exists(dir))
         {
-            if (a.Protected)
+            if (a.Protected || !DcSafeDir(dir))
             {
-                log("· 属于系统组件目录，已跳过目录删除");
+                log("· 该目录是系统/公共目录，已跳过删除：" + dir);
             }
             else
             {
@@ -580,6 +582,73 @@ static class Uninstaller
 
     // ==================== 深度残留清理 ====================
 
+    static List<string> dcDeny = null;
+
+    /// <summary>判断目录是否可以安全删除（拒绝盘根、系统目录、用户目录本体）。</summary>
+    static bool DcSafeDir(string path)
+    {
+        try
+        {
+            string p = Path.GetFullPath(path).TrimEnd('\\').ToLower();
+            if (p.Length <= 2) return false;                       // C:\ 、D:\
+            if (dcDeny == null)
+            {
+                dcDeny = new List<string>();
+                Environment.SpecialFolder[] sf = new Environment.SpecialFolder[]
+                {
+                    Environment.SpecialFolder.Windows,
+                    Environment.SpecialFolder.System,
+                    Environment.SpecialFolder.ProgramFiles,
+                    Environment.SpecialFolder.ProgramFilesX86,
+                    Environment.SpecialFolder.CommonApplicationData,
+                    Environment.SpecialFolder.ApplicationData,
+                    Environment.SpecialFolder.LocalApplicationData,
+                    Environment.SpecialFolder.UserProfile,
+                    Environment.SpecialFolder.Desktop,
+                    Environment.SpecialFolder.MyDocuments,
+                    Environment.SpecialFolder.MyPictures,
+                    Environment.SpecialFolder.MyMusic,
+                    Environment.SpecialFolder.MyVideos
+                };
+                for (int i = 0; i < sf.Length; i++)
+                {
+                    try
+                    {
+                        string d = Environment.GetFolderPath(sf[i]);
+                        if (!string.IsNullOrEmpty(d)) dcDeny.Add(Path.GetFullPath(d).TrimEnd('\\').ToLower());
+                    }
+                    catch { }
+                }
+                try
+                {
+                    string la = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+                    if (la.Length > 0) dcDeny.Add(Path.GetFullPath(Path.Combine(Directory.GetParent(la).FullName, "LocalLow")).TrimEnd('\\').ToLower());
+                    string up = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+                    if (up.Length > 0)
+                    {
+                        dcDeny.Add(Path.GetFullPath(Path.Combine(up, "AppData")).TrimEnd('\\').ToLower());
+                        string parent = Directory.GetParent(up).FullName;      // C:\Users
+                        dcDeny.Add(Path.GetFullPath(parent).TrimEnd('\\').ToLower());
+                    }
+                }
+                catch { }
+                foreach (string dr in Directory.GetLogicalDrives())
+                {
+                    string d = dr.TrimEnd('\\').ToLower();
+                    if (d.Length > 0) dcDeny.Add(d);
+                }
+            }
+            string leaf = Path.GetFileName(p);
+            if (leaf == "windows" || leaf == "program files" || leaf == "program files (x86)" ||
+                leaf == "programdata" || leaf == "appdata" || leaf == "users" || leaf == "public" ||
+                leaf == "desktop" || leaf == "documents" || leaf == "downloads" || leaf == "music" ||
+                leaf == "pictures" || leaf == "videos" || leaf == "onedrive") return false;
+            for (int i = 0; i < dcDeny.Count; i++) if (p == dcDeny[i]) return false;
+            return true;
+        }
+        catch { return false; }
+    }
+
     static readonly string[] DcSkip = new string[]
     {
         "windows","windowsapps","microsoft","common files","packages","temp","system32","syswow64",
@@ -600,8 +669,38 @@ static class Uninstaller
     {
         "cache","caches","data","temp","tmp","log","logs","config","settings","updat","download",
         "webview","crash","userdata","user data","profile","local","roaming","backup","bak",
-        "install","setup","bin","lib","dump","report","telemetry","stat","stats"
+        "install","setup","bin","lib","dump","report","telemetry","stat","stats",
+        "app","link","router","htm","html","pdf","csv","excel","word","ppt","image","img",
+        "protocol","plugin","plug","handler","menu","shell","ext","assoc","verb","clsid",
+        "run","start","startup","tray","agent","assist","helper"
     };
+
+    // 用户目录下这些是系统/外壳目录或联接点，永远不能碰
+    static readonly string[] DcShell = new string[]
+    {
+        "appdata","application data","local settings","desktop","documents","downloads","music",
+        "pictures","videos","onedrive","favorites","links","recent","saved games","searches","sendto",
+        "templates","contacts","cookies","nethood","printhood","my documents","start menu","「开始」菜单",
+        "3d objects","node_modules"
+    };
+
+    static bool DcShellName(string f)
+    {
+        string s = f.Trim().ToLower();
+        if (s.Length > 0 && s[0] == '.') return true;        // .ssh / .cache / .gradle 等配置目录
+        for (int i = 0; i < DcShell.Length; i++) if (s == DcShell[i]) return true;
+        return false;
+    }
+
+    static bool DcIsLink(string path)
+    {
+        try
+        {
+            FileAttributes at = File.GetAttributes(path);
+            return (at & FileAttributes.ReparsePoint) != 0;
+        }
+        catch { return true; }
+    }
 
     static bool DcBadName(string f)
     {
@@ -617,13 +716,22 @@ static class Uninstaller
     {
         if (string.IsNullOrEmpty(s)) return;
         s = s.Trim().Trim('"', '\'', ' ', '.', '-', '_');
-        if (s.Length < 2) return;
+        if (s.Length < 2 || s.Length > 60) return;
         if (DcBadName(s)) return;
+        if (s.IndexOf('{') >= 0 || s.IndexOf('}') >= 0) return;       // MSI 的 {GUID}
+        if (s.StartsWith("0x") || s.StartsWith("$")) return;
+        int hex = 0;
+        for (int i = 0; i < s.Length; i++)
+        {
+            char c = s[i];
+            if ((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')) hex++;
+        }
+        if (hex == s.Length && s.Length >= 8) return;                  // 纯十六进制串
         for (int i = 0; i < list.Count; i++) if (string.Equals(list[i], s, StringComparison.OrdinalIgnoreCase)) return;
         list.Add(s);
     }
 
-    /// <summary>从软件名、发布者、安装目录、卸载程序名里提取可用于匹配残留的“关键词”。</summary>
+    /// <summary>从软件名、注册表键名、安装目录、卸载程序名、图标路径里提取可用于匹配残留的“关键词”。</summary>
     static List<string> Tokens(AppInfo a)
     {
         List<string> t = new List<string>();
@@ -636,16 +744,63 @@ static class Uninstaller
         AddTok(t, noBr);
         AddTok(t, name);
 
-        if (!string.IsNullOrEmpty(a.InstallLocation)) AddTok(t, Path.GetFileName(a.InstallLocation.Trim().Trim('"').TrimEnd('\\')));
+        // 注册表卸载键名，例如 ...\Uninstall\Doubao → Doubao（中文名 + 英文目录的软件靠它）
+        if (!string.IsNullOrEmpty(a.RegPath))
+        {
+            string rp = a.RegPath.TrimEnd('\\');
+            int bs = rp.LastIndexOf('\\');
+            if (bs >= 0) rp = rp.Substring(bs + 1);
+            AddTok(t, rp);
+        }
 
+        // 安装目录名
+        if (!string.IsNullOrEmpty(a.InstallLocation))
+            AddTok(t, Path.GetFileName(a.InstallLocation.Trim().Trim('"').TrimEnd('\\')));
+
+        // 图标路径：C:\Doubao\icon.ico → Doubao / C:\Doubao
+        if (!string.IsNullOrEmpty(a.DisplayIcon))
+        {
+            string icon = a.DisplayIcon.Trim().Trim('"');
+            int comma = icon.IndexOf(',');
+            if (comma > 0) icon = icon.Substring(0, comma);
+            icon = icon.Trim().Trim('"');
+            if (icon.Length > 0)
+            {
+                string stem = Path.GetFileNameWithoutExtension(icon);
+                AddTok(t, stem);
+                string idir = Path.GetDirectoryName(icon);
+                if (!string.IsNullOrEmpty(idir)) AddTok(t, Path.GetFileName(idir));
+                idir = idir == null ? "" : Path.GetDirectoryName(idir);
+                if (idir != null && idir.Length > 0) AddTok(t, Path.GetFileName(idir));
+            }
+        }
+
+        // 卸载程序：C:\Doubao\uninstall.exe → Doubao（目录名），非通用名再取 exe 名
         string uexe = ParseExe(a.UninstallString);
         if (uexe.Length > 0)
         {
+            string udir = Path.GetDirectoryName(uexe);
+            if (!string.IsNullOrEmpty(udir)) AddTok(t, Path.GetFileName(udir));
             string en = Path.GetFileNameWithoutExtension(uexe);
             string low = en.ToLower();
             if (low.IndexOf("unins") < 0 && low.IndexOf("uninstall") < 0 && low.IndexOf("setup") < 0 &&
                 low.IndexOf("update") < 0 && low.IndexOf("inst") < 0)
                 AddTok(t, en);
+        }
+
+        string qexe = ParseExe(a.QuietUninstall);
+        if (qexe.Length > 0 && qexe != uexe)
+        {
+            string qdir = Path.GetDirectoryName(qexe);
+            if (!string.IsNullOrEmpty(qdir)) AddTok(t, Path.GetFileName(qdir));
+        }
+
+        // 名称按空格拆出的长词（只取 ≥5 字符，避免 Abc 之类碎片）
+        string[] parts = Regex.Split(noBit, @"\s+");
+        for (int i = 0; i < parts.Length; i++)
+        {
+            string p = parts[i].Trim();
+            if (p.Length >= 5) AddTok(t, p);
         }
         return t;
     }
@@ -653,7 +808,8 @@ static class Uninstaller
     static bool DcHit(string folder, List<string> tokens)
     {
         if (DcBadName(folder)) return false;
-        string f = folder.Trim().ToLower();
+        string orig = folder.Trim();
+        string f = orig.ToLower();
         for (int i = 0; i < tokens.Count; i++)
         {
             string tok = tokens[i].Trim().ToLower();
@@ -668,6 +824,20 @@ static class Uninstaller
                 if (c >= '0' && c <= '9') return true;        // AppName70 / AppName 2.x
                 for (int k = 0; k < DcSuffix.Length; k++)
                     if (rest.StartsWith(DcSuffix[k], StringComparison.Ordinal)) return true;
+                // 驼峰式附属组件：DoubaoLinkRouter → 关键词后紧跟大写字母且后面还有小写词根
+                if (orig.Length > tok.Length && char.IsUpper(orig[tok.Length]))
+                {
+                    string restO = orig.Substring(tok.Length);
+                    if (restO.Length >= 6)
+                    {
+                        bool hasLower = false;
+                        for (int q = 1; q < restO.Length; q++)
+                        {
+                            if (char.IsLower(restO[q])) { hasLower = true; break; }
+                        }
+                        if (hasLower) return true;
+                    }
+                }
             }
         }
         return false;
@@ -715,15 +885,105 @@ static class Uninstaller
             for (int i = 0; i < kids.Length; i++)
             {
                 string k = kids[i];
+                if (DcIsLink(k)) continue;                     // 跳过联接点/符号链接，避免顺着删到别处
                 if (DcHit(Path.GetFileName(k), tokens)) { AddPath(found, k); continue; }
                 // 供应商目录（如 Tencent、Adobe）里再找一层同名子目录
                 string[] subs;
                 try { subs = Directory.GetDirectories(k); } catch { continue; }
                 for (int j = 0; j < subs.Length; j++)
                 {
+                    if (DcIsLink(subs[j])) continue;
                     if (DcHit(Path.GetFileName(subs[j]), tokens)) AddPath(found, subs[j]);
                 }
             }
+        }
+
+        // 用户目录根（C:\Users\<用户名>\Doubao 这种软件自建的数据根目录）
+        string up = "";
+        try { up = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile); } catch { }
+        if (up.Length > 0 && Directory.Exists(up))
+        {
+            string[] kids;
+            try { kids = Directory.GetDirectories(up); } catch { kids = new string[0]; }
+            for (int i = 0; i < kids.Length; i++)
+            {
+                string nm = Path.GetFileName(kids[i]);
+                if (DcShellName(nm) || DcIsLink(kids[i])) continue;
+                if (DcHit(nm, tokens)) AddPath(found, kids[i]);
+            }
+
+            // 文档目录里软件自建的子文件夹（只钻一层）
+            string[] docRoots = new string[]
+            {
+                Path.Combine(up, "Documents"),
+                Path.Combine(Path.Combine(up, "OneDrive"), "Documents")
+            };
+            for (int d = 0; d < docRoots.Length; d++)
+            {
+                string dr = docRoots[d];
+                if (!Directory.Exists(dr)) continue;
+                string[] subs;
+                try { subs = Directory.GetDirectories(dr); } catch { continue; }
+                for (int j = 0; j < subs.Length; j++)
+                {
+                    if (DcIsLink(subs[j])) continue;
+                    if (DcHit(Path.GetFileName(subs[j]), tokens)) AddPath(found, subs[j]);
+                }
+            }
+        }
+    }
+
+    /// <summary>清理 %TEMP% 下与软件同名同前缀的临时文件（如 Doubao-xxxxx.log）。</summary>
+    static void DcCleanTempFiles(List<string> tokens, Action<string> log)
+    {
+        string tmp = "";
+        try { tmp = Path.GetTempPath(); } catch { }
+        if (tmp.Length == 0 || !Directory.Exists(tmp)) return;
+        string[] files;
+        try { files = Directory.GetFiles(tmp); } catch { return; }
+        for (int i = 0; i < files.Length; i++)
+        {
+            string nm = Path.GetFileNameWithoutExtension(files[i]);
+            if (nm.Length < 3 || !DcHit(nm, tokens)) continue;
+            try
+            {
+                if (FileForce.DeleteFile(files[i])) log("· 已删除临时文件 " + Path.GetFileName(files[i]));
+            }
+            catch { }
+        }
+    }
+
+    static readonly string[] DcSysProc = new string[]
+    {
+        "explorer","svchost","csrss","winlogon","services","lsass","smss","wininit","dwm","fontdrvhost",
+        "system","idle","taskhostw","conhost","ctfmon","runtimebroker","searchhost","startmenuexperiencehost",
+        "shellexperiencehost","applicationframehost","securityhealthservice","msmpeng","nissrv","searchindexer",
+        "winlogon.exe","spoolsv","audiodg","wudfhost","trustedinstaller","tihmain","smartscreen","wuauclt",
+        "litemanager","轻量软件管理器"
+    };
+
+    /// <summary>按进程名匹配关键词结束进程（安装目录未知时也能清掉自启的常驻进程）。</summary>
+    static void DcKillByName(List<string> tokens, Action<string> log)
+    {
+        Process[] ps;
+        try { ps = Process.GetProcesses(); } catch { return; }
+        for (int i = 0; i < ps.Length; i++)
+        {
+            try
+            {
+                if (ps[i].Id == Process.GetCurrentProcess().Id) continue;
+                string pn = ps[i].ProcessName;
+                if (pn.Length < 2 || DcBadName(pn)) continue;
+                bool sys = false;
+                for (int s = 0; s < DcSysProc.Length; s++)
+                    if (string.Equals(pn, DcSysProc[s], StringComparison.OrdinalIgnoreCase)) { sys = true; break; }
+                if (sys) continue;
+                if (!DcHit(pn, tokens)) continue;
+                ps[i].Kill();
+                ps[i].WaitForExit(3000);
+                log("· 已结束进程 " + pn + ".exe");
+            }
+            catch { }
         }
     }
 
@@ -763,7 +1023,7 @@ static class Uninstaller
     {
         List<string> parents = new List<string>();
         RegistryKey[] hives = new RegistryKey[] { Registry.CurrentUser, Registry.LocalMachine };
-        string[] roots = new string[] { "Software", "Software\\WOW6432Node" };
+        string[] roots = new string[] { "Software", "Software\\WOW6432Node", "Software\\Classes" };
         for (int h = 0; h < hives.Length; h++)
         {
             for (int r = 0; r < roots.Length; r++)
@@ -868,18 +1128,24 @@ static class Uninstaller
                 k.Close();
             }
             if (img.Length == 0) continue;
+            string imgNorm = img.Replace("\"", "").Trim();
             bool hit = false;
             for (int d = 0; d < dirs.Length; d++)
             {
-                if (dirs[d].Length > 6 && img.IndexOf(dirs[d], StringComparison.OrdinalIgnoreCase) >= 0) { hit = true; break; }
+                string dd = dirs[d];
+                if (dd.Length <= 6 || !DcSafeDir(dd)) continue;
+                // 必须是“安装目录之下”的可执行文件，不做全文包含匹配（否则 C:\Program Files 会命中一切）
+                string prefix = dd.TrimEnd('\\') + "\\";
+                if (imgNorm.StartsWith(prefix, StringComparison.OrdinalIgnoreCase)) { hit = true; break; }
             }
             if (!hit)
             {
-                string exe = ParseExe(img.Replace("\"", ""));
-                if (exe.Length > 4)
+                string exe = ParseExe(imgNorm);
+                if (exe.Length > 4 && !DcBadName(Path.GetFileNameWithoutExtension(exe)))
                 {
                     string en = Path.GetFileNameWithoutExtension(exe);
-                    if (en.Length >= 2 && DcHit(en, tokens)) hit = true;
+                    // 仅当服务名本身也与关键词一致时才按文件名判断，避免误删系统服务
+                    if (DcHit(n, tokens) && en.Length >= 2 && DcHit(en, tokens)) hit = true;
                 }
             }
             if (!hit) continue;
@@ -957,6 +1223,7 @@ static class Uninstaller
                 }
                 if (inBase) break;
                 if (!Directory.Exists(parent)) break;
+                if (!DcSafeDir(parent)) break;
                 string[] files = null;
                 string[] subs = null;
                 try { files = Directory.GetFiles(parent); subs = Directory.GetDirectories(parent); } catch { break; }
@@ -976,7 +1243,7 @@ static class Uninstaller
     static void DcPruneEmptyReg(List<string> tokens, Action<string> log)
     {
         RegistryKey[] hives = new RegistryKey[] { Registry.CurrentUser, Registry.LocalMachine };
-        string[] roots = new string[] { "Software", "Software\\WOW6432Node" };
+        string[] roots = new string[] { "Software", "Software\\WOW6432Node", "Software\\Classes" };
         for (int h = 0; h < hives.Length; h++)
         {
             for (int r = 0; r < roots.Length; r++)
@@ -1020,8 +1287,29 @@ static class Uninstaller
             string ed = Path.GetDirectoryName(uexe);
             if (ed != null && ed.Length > 6) AddPath(dirs, ed);
         }
+        // 关键安全阀：安装目录若登记成 C:\Program Files 这种公共目录，绝不能拿去匹配服务/任务/删除
+        for (int i = dirs.Count - 1; i >= 0; i--)
+            if (!DcSafeDir(dirs[i])) dirs.RemoveAt(i);
 
-        // 目标目录：安装目录 + AppData 系列缓存
+        // 先按进程名把常驻/自启进程干掉（安装目录未知时这一步很关键）
+        if (!a.Protected && tokens.Count > 0)
+        {
+            DcKillByName(tokens, log);
+            Thread.Sleep(300);
+        }
+
+        // 卸载注册表项本身也在这里补一刀（重复删除无害）
+        if (!string.IsNullOrEmpty(a.RegPath))
+        {
+            RegistryKey[] hiveTry = new RegistryKey[] { Registry.CurrentUser, Registry.LocalMachine };
+            for (int hh = 0; hh < hiveTry.Length; hh++)
+            {
+                try { hiveTry[hh].DeleteSubKeyTree(a.RegPath, false); }
+                catch { }
+            }
+        }
+
+        // 目标目录：安装目录 + AppData 系列缓存 + 用户目录根
         List<string> targets = new List<string>();
         if (!a.Protected)
         {
@@ -1029,6 +1317,8 @@ static class Uninstaller
                 if (Directory.Exists(dirs[i])) AddPath(targets, dirs[i]);
             if (tokens.Count > 0) DcScanDirs(tokens, targets);
         }
+        for (int i = targets.Count - 1; i >= 0; i--)
+            if (!DcSafeDir(targets[i])) targets.RemoveAt(i);
 
         if (targets.Count > 0) log("· 深度清理：找到 " + targets.Count + " 个残留目录");
         int okCount = 0;
@@ -1047,6 +1337,7 @@ static class Uninstaller
         DcCleanRegistry(tokens, log);
         DcCleanRun(tokens, dirs.ToArray(), log);
         DcCleanStartupLnk(tokens, log);
+        if (!a.Protected && tokens.Count > 0) DcCleanTempFiles(tokens, log);
         if (!a.Protected)
         {
             DcCleanServices(dirs.ToArray(), tokens, log);
@@ -2718,12 +3009,15 @@ class MainForm : Form
         sb.AppendLine();
         sb.AppendLine("流程：先静默调用卸载程序，然后做深度残留清理：");
         sb.AppendLine("  ① 安装目录与卸载程序目录（含被占用文件强制删除、失败自动重试）");
-        sb.AppendLine("  ② %LocalAppData% / %AppData% / %LocalLow% / %ProgramData% / Temp 下同名及厂商目录内的同名缓存");
-        sb.AppendLine("  ③ 注册表 HKCU/HKLM\\Software 下同名、厂商目录内的同名子键，以及空壳父键");
+        sb.AppendLine("  ② %LocalAppData% / %AppData% / %LocalLow% / %ProgramData% / Temp / Programs");
+        sb.AppendLine("     以及 C:\\Users\\<用户名> 根目录、文档目录下软件自建的同名数据目录");
+        sb.AppendLine("     （匹配同名 / 同名前缀如 AppName70、AppNameCache、AppNameLinkRouter）");
+        sb.AppendLine("  ③ 注册表 HKCU/HKLM\\Software 与 Software\\Classes 下同名键、厂商键内同名子键、空壳父键");
         sb.AppendLine("  ④ 开机启动项（Run / RunOnce / 启动文件夹快捷方式）");
         sb.AppendLine("  ⑤ 指向安装目录的系统服务（sc stop + sc delete）");
         sb.AppendLine("  ⑥ 引用安装目录的计划任务（schtasks /delete）");
-        sb.AppendLine("  ⑦ 开始菜单、桌面等位置的快捷方式");
+        sb.AppendLine("  ⑦ 开始菜单、桌面等位置的快捷方式、%TEMP% 下的同名临时文件");
+        sb.AppendLine("  ⑧ 按进程名结束软件常驻进程（跳过系统进程与本程序自身）");
         sb.AppendLine("该操作不可撤销，请确认无误后继续。");
 
         if (MessageBox.Show(sb.ToString(), "确认卸载", MessageBoxButtons.OKCancel, MessageBoxIcon.Warning, MessageBoxDefaultButton.Button2) != DialogResult.OK)
@@ -3148,5 +3442,6 @@ static class Program
         Application.Run(new MainForm());
     }
 }
+
 
 

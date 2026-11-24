@@ -1,6 +1,6 @@
 # 轻量软件管理器 LiteManager
 
-一个 **约 84 KB 单文件绿色版** 的 Windows 小工具：强制卸载软件并深度清理残留、识别疑似流氓软件、按类型批量管理和强删文件（文档 / 图片 / 视频 / 压缩包 ）、文件夹搜寻，所有列表都能点列头排序。
+一个 **约 88 KB 单文件绿色版** 的 Windows 小工具：强制卸载软件并深度清理残留、识别疑似流氓软件、按类型批量管理和强删文件（文档 / 图片 / 视频 / 压缩包 ）、文件夹搜寻，所有列表都能点列头排序。
 
 - 单文件 exe，**不用安装**，双击就能跑，不写系统目录、不装服务、不联网
 - 无第三方依赖、无 NuGet 包，只用 .NET Framework 自带的 WinForms
@@ -80,8 +80,10 @@
 1. 清掉只读/隐藏/系统属性，直接 `File.Delete`；
 2. 用 **Restart Manager**（`rstrtmgr.dll` 的 `RmStartSession` / `RmRegisterResources` / `RmGetList`）查出到底是哪个进程占着这个文件，然后结束它（`explorer / svchost / csrss / winlogon / services / lsass / smss / wininit / dwm` 这些系统进程跳过，避免搞崩系统）；
 3. `takeown /f` + `icacls /grant *S-1-5-32-544:F` 把所有权和完全控制权拿过来；
-4. 还不行就用系统底层 `cmd /c del /f /q`，目录用 `rd /s /q` 递归兜底。
-超过 240 字符的长路径自动加 `\\?\` 前缀。目录删除是「先逐文件强删、再逐层删空目录」，所以只读、被占用、权限不足的目录树都能清掉。
+4. 还不行就用系统底层 `cmd /c del /f /q`，目录用 `rd /s /q` 递归兜底；
+5. 仍被独占（`.lock` / `.lck` 这类句柄没放开）→ 用 `CreateFile` 带 `FILE_FLAG_DELETE_ON_CLOSE` 打开后立即关闭，句柄一关文件就没了；再不行把文件改名到 `~lm_del_xxx` 随机名（打破路径锁）再删；
+6. 最后手段：`MoveFileEx(..., MOVEFILE_DELAY_UNTIL_REBOOT)` 写进 `PendingFileRenameOperations`，**重启时由系统在加载任何进程之前删掉**，并在日志里注明「已登记重启后自动删除」。
+超过 240 字符的长路径自动加 `\\?\` 前缀。目录删除是「先逐文件强删、再逐层删空目录」，树里剩下的死角同样走第 5、6 步登记，所以只读、被占用、权限不足、带锁文件的目录树都能清掉。
 
 ### 4. 全盘扫描 —— `DocScanner`
 - 只扫**固定磁盘**（`DriveType.Fixed`），U 盘/光驱/网络盘不碰；
@@ -101,7 +103,7 @@
 - 虚拟列表排序不能动控件，做法是排一份**下标数组**，再按新顺序重建 `View` 和与之平行的 `Chk`（勾选状态），所以排序后勾选跟着文件走、不会串行；重新扫描完成时如果已有排序列，会自动再套一遍排序；
 
 ### 7. 深度残留清理 —— `Uninstaller.DeepClean`
-卸载程序跑完后还会「卸不干净」，所以 v1.8 加了一层自己的清理器，v1.9 又做了一轮补强。逻辑是**先算关键词，再按关键词找目标，最后逐项强删并校验**：
+卸载程序跑完后还会「卸不干净」，所以 v1.8 加了一层自己的清理器，v1.9、v2.0 又做了两轮补强。逻辑是**先算关键词，再按关键词找目标，最后逐项强删并校验**：
 
 - **关键词**（v1.9 扩充）：软件显示名剥掉括号、版本号、`64-bit / x64` 后得到主名；再加上 **注册表卸载键名**（`...\Uninstall\Doubao` → `Doubao`）、安装目录名、**卸载程序所在目录**、**图标路径**、静默卸载程序目录，以及名称里 ≥5 字符的分词。这一条解决了「中文显示名 + 英文目录」的经典错配（显示 `豆包`、数据目录叫 `Doubao`）。短于 2 字符、命中 `setup / app / client / temp` 等通用词、`{GUID}`、纯十六进制串一律丢弃。
 - **目录匹配**（`DcHit`）：同名即命中；比关键词长时，要求关键词后紧跟分隔符（`空格 - _ . ( [ +`）、数字（`AppName70`）、已知后缀（`cache / data / temp / log / config / updater / webview / crash / app / link / router / htm / pdf ...`）或**驼峰附属组件**（`DoubaoLinkRouter` 这种「关键词 + 大写词根且 ≥6 字符」）。反过来 `AppNameOther`、`AppName2` 这类不同产品不会命中。
@@ -113,6 +115,8 @@
 - **计划任务**：递归读 `C:\Windows\System32\Tasks` 下的任务文件，内容里出现安装目录的，用 `schtasks /delete /tn <相对名> /f` 删掉。
 - **进程**：`KillIn(dir)` 杀掉可执行文件在目标目录内的进程；再加一层 `DcKillByName`，按进程名匹配关键词结束常驻进程（跳过 `explorer / svchost / lsass` 等系统进程、跳过本程序自身），解决「安装目录登记为空、进程却在跑」的情况。
 - **临时文件**：`%TEMP%` 下与关键词同名 / 同前缀的文件（`Doubao-1234.log`）一并清掉。
+- **锁文件**（v2.0 新增）：`%AppData%`、`%LocalAppData%`、`%LocalLow%`、`%ProgramData%`、`%TEMP%`、`C:\Users\<用户名>` 下（含一级、二级子目录）扫 `*.lock / *.lck / *.lockfile / *.lckfile`，文件名命中关键词就删；删不掉时先杀占用进程，再走「关闭即删除」「改名再删」，最后登记重启删除。
+- **占用/无权限文件**（v2.0 新增）：目录树里任何一个文件删不掉，都不会直接放弃——单文件梯度从 Restart Manager 杀进程、takeown/icacls 接管，到独占句柄删除、改名删除，最后 `PendingFileRenameOperations` 重启删除，日志里明确写「已登记重启后自动删除」。
 - **安全阀 `DcSafeDir`**：`C:\`、`C:\Windows`、`Program Files`、`ProgramData`、`AppData`、用户目录本体、`Desktop / Documents / Downloads` 这些路径永远判为「不可删」；安装目录若被软件登记成公共目录，删除与服务/任务匹配全部跳过——以前这一条会把整个 `Program Files` 当安装目录删掉，v1.9 已修掉。
 - **重试与校验**：删除失败不是直接放弃——`KillIn` 杀占用进程、`DeleteDir` 强删，最多重试 3 轮，仍失败会写进「卸载结果」对话框，提示重启后重试；最后再扫一遍目标列表，确认真的不存在了才算完成。
 
@@ -122,7 +126,7 @@
 
 ```
 LiteManager/
-├─ bin/LiteManager.exe      # 编译好的 84 KB 成品
+├─ bin/LiteManager.exe      # 编译好的 88 KB 成品
 ├─ src/LiteManager.cs       # 全部源码（单文件）
 ├─ src/app.manifest         # requireAdministrator + dpiAware
 ├─ src/app.ico              # 图标
@@ -132,6 +136,12 @@ LiteManager/
 
 ## 更新日志
 
+- **v2.0**：锁文件 / 被占用 / 无权限文件「必须删掉」专项
+  - `FileForce` 删除梯度再加两级：`FILE_FLAG_DELETE_ON_CLOSE` 独占句柄删除 → 改名 `~lm_del_xxx` 后删除
+  - 兜底新增 `MoveFileEx(MOVEFILE_DELAY_UNTIL_REBOOT)`：真正删不掉的（独占句柄）登记进系统 `PendingFileRenameOperations`，**开机时系统在加载进程之前自动清除**，日志标注「已登记重启后删除」
+  - 目录树删完仍有残留时走 `PendTree`：树内每个文件/空目录逐项登记重启删除，不再出现「删了一半就报失败」
+  - 新增 `DcCleanLocks`：在 `AppData / LocalLow / ProgramData / TEMP / 用户根`（深度 2 层）扫 `*.lock / *.lck / *.lockfile / *.lckfile`，命中关键词的锁文件直接删，删不掉同样走杀进程 → 独占句柄 → 重启删除
+  - `Uninstaller` 日志区分「已删除」与「已清理（残留登记重启后删除）」，并汇总登记项数量，不再出现假成功
 - **v1.9**：深度清理全量加强 + 三处隐性 bug 修复
   - 关键词新增「注册表卸载键名 / 卸载程序目录 / 图标路径」，修掉「显示名是中文、数据目录是英文」的软件清不干净的问题（例：`豆包` 的数据目录 `C:\Users\xxx\Doubao` 以前完全匹配不到）
   - 扫描范围新增 `C:\Users\<用户名>` 根目录与「文档」下的软件数据目录，并跳过 `Application Data` / `Local Settings` 这类联接点

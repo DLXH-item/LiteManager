@@ -953,6 +953,74 @@ static class Uninstaller
         }
     }
 
+    /// <summary>清理 AppData / TEMP / 用户根下与软件同名的 .lock/.lck 锁文件（含被占用、无权限的）。</summary>
+    static void DcCleanLocks(List<string> tokens, Action<string> log)
+    {
+        List<string> roots = new List<string>();
+        string ad = "", lad = "", up = "";
+        try { ad = Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData); } catch { }
+        try { lad = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData); } catch { }
+        try { up = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile); } catch { }
+        if (ad.Length > 0) roots.Add(ad);
+        if (lad.Length > 0)
+        {
+            roots.Add(lad);
+            roots.Add(Path.GetDirectoryName(lad) + @"\LocalLow");
+        }
+        try
+        {
+            string pd = Environment.GetEnvironmentVariable("ProgramData");
+            if (string.IsNullOrEmpty(pd)) pd = @"C:\ProgramData";
+            roots.Add(pd);
+        }
+        catch { }
+        try { roots.Add(Path.GetTempPath()); } catch { }
+        if (up.Length > 0) roots.Add(up);
+
+        for (int i = 0; i < roots.Count; i++)
+        {
+            try { if (Directory.Exists(roots[i])) DcScanLocks(roots[i], 0, tokens, log); }
+            catch { }
+        }
+    }
+
+    static void DcScanLocks(string dir, int depth, List<string> tokens, Action<string> log)
+    {
+        if (depth > 2) return;
+        string[] pats = new string[] { "*.lock", "*.lck", "*.lockfile", "*.lckfile" };
+        for (int p = 0; p < pats.Length; p++)
+        {
+            string[] files = null;
+            try { files = Directory.GetFiles(dir, pats[p]); } catch { }
+            if (files == null) continue;
+            for (int i = 0; i < files.Length; i++)
+            {
+                string f = files[i];
+                string nm = Path.GetFileNameWithoutExtension(f);
+                if (nm.Length < 3 || !DcHit(nm, tokens)) continue;
+                try
+                {
+                    if (FileForce.DeleteFile(f, true, log)) log("· 已删除锁文件 " + f);
+                    else log("× 锁文件删除失败：" + f);
+                }
+                catch { }
+            }
+        }
+        string[] subs = null;
+        try { subs = Directory.GetDirectories(dir); } catch { }
+        if (subs == null) return;
+        for (int i = 0; i < subs.Length; i++)
+        {
+            try
+            {
+                FileAttributes fa = File.GetAttributes(subs[i]);
+                if ((fa & FileAttributes.ReparsePoint) != 0) continue;
+            }
+            catch { continue; }
+            try { DcScanLocks(subs[i], depth + 1, tokens, log); } catch { }
+        }
+    }
+
     static readonly string[] DcSysProc = new string[]
     {
         "explorer","svchost","csrss","winlogon","services","lsass","smss","wininit","dwm","fontdrvhost",
@@ -1276,6 +1344,7 @@ static class Uninstaller
     /// <summary>深度清理：安装目录 + AppData 缓存 + 注册表 + 服务 + 计划任务 + 开机启动。返回清理的目录数。</summary>
     public static int DeepClean(AppInfo a, Action<string> log)
     {
+        FileForce.Pended = 0;
         List<string> tokens = Tokens(a);
         string dir = a.InstallLocation == null ? "" : a.InstallLocation.Trim().Trim('"').TrimEnd('\\');
         string uexe = ParseExe(a.UninstallString);
@@ -1325,8 +1394,14 @@ static class Uninstaller
         for (int i = 0; i < targets.Count; i++)
         {
             string p = targets[i];
+            int pendBefore = FileForce.Pended;
             bool ok = DcForceDelete(p, log);
-            if (ok) { okCount++; log("· 已删除 " + p); }
+            if (ok)
+            {
+                okCount++;
+                if (FileForce.Pended > pendBefore) log("· 已清理（被占用的残留已登记重启后删除）" + p);
+                else log("· 已删除 " + p);
+            }
             else log("× 删除失败（可能仍被占用）：" + p);
         }
         DcPruneEmpty(targets, log);
@@ -1337,7 +1412,11 @@ static class Uninstaller
         DcCleanRegistry(tokens, log);
         DcCleanRun(tokens, dirs.ToArray(), log);
         DcCleanStartupLnk(tokens, log);
-        if (!a.Protected && tokens.Count > 0) DcCleanTempFiles(tokens, log);
+        if (!a.Protected && tokens.Count > 0)
+        {
+            DcCleanTempFiles(tokens, log);
+            DcCleanLocks(tokens, log);
+        }
         if (!a.Protected)
         {
             DcCleanServices(dirs.ToArray(), tokens, log);
@@ -1349,6 +1428,8 @@ static class Uninstaller
         for (int i = 0; i < targets.Count; i++)
             if (Directory.Exists(targets[i])) { left++; log("· 仍残留（可重启后再删）：" + targets[i]); }
         if (left == 0 && targets.Count > 0) log("· 残留目录已全部清除");
+        if (FileForce.Pended > 0)
+            log("· 共 " + FileForce.Pended + " 项被独占占用，已登记重启后自动删除");
         return okCount;
     }
 }
@@ -1543,7 +1624,117 @@ static class FileForce
         catch { return false; }
     }
 
-    // 删单个文件：直接删 → 终止占用进程 → 接管权限 → cmd 强删
+    // ===== 锁文件 / 被占用 / 无权限文件 强删增强 =====
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    static extern bool MoveFileEx(string src, string dst, int flags);
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    static extern IntPtr CreateFileW(string name, uint access, uint share, IntPtr sec,
+        uint disp, uint flags, IntPtr tmpl);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    static extern bool CloseHandle(IntPtr h);
+
+    const int MOVEFILE_REPLACE_EXISTING = 1;
+    const int MOVEFILE_DELAY_UNTIL_REBOOT = 4;
+    const uint LM_DELETE = 0x00010000;
+    const uint LM_GENERIC_READ = 0x80000000;
+    const uint LM_SHARE_ALL = 0x00000007;
+    const uint LM_OPEN_EXISTING = 3;
+    const uint LM_DELETE_ON_CLOSE = 0x04000000;
+    const uint LM_BACKUP_SEMANTICS = 0x02000000;
+
+    // 锁文件 / 占用标记类文件
+    public static bool IsLockFile(string path)
+    {
+        string n = Path.GetFileName(path).ToLower();
+        return n.EndsWith(".lock") || n.EndsWith(".lck") || n.EndsWith(".lockfile")
+            || n.EndsWith(".lckfile") || n.EndsWith(".pid") || n.EndsWith(".lock~");
+    }
+
+    static bool IsValidHandle(IntPtr h)
+    {
+        return h != IntPtr.Zero && h != new IntPtr(-1);
+    }
+
+    // 「关闭即删除」句柄：对方允许 DELETE 共享时立即生效
+    public static bool DeleteOnClose(string path)
+    {
+        try
+        {
+            if (!Exists(path)) return true;
+            uint flags = LM_DELETE_ON_CLOSE;
+            if (Directory.Exists(path)) flags |= LM_BACKUP_SEMANTICS;
+            IntPtr h = CreateFileW(ToLong(path), LM_DELETE | LM_GENERIC_READ, LM_SHARE_ALL,
+                IntPtr.Zero, LM_OPEN_EXISTING, flags, IntPtr.Zero);
+            if (!IsValidHandle(h)) return false;
+            CloseHandle(h);
+            return !Exists(path);
+        }
+        catch { return false; }
+    }
+
+    // 改名到同目录随机名再删，打破路径锁
+    static bool RenameThenDelete(string path)
+    {
+        try
+        {
+            if (!Exists(path)) return true;
+            if (Directory.Exists(path)) return false;
+            string dir = Path.GetDirectoryName(path);
+            string tmp = Path.Combine(dir, "~lm_del_" + Guid.NewGuid().ToString("N").Substring(0, 8) + Path.GetExtension(path));
+            try { File.SetAttributes(path, FileAttributes.Normal); } catch { }
+            if (!MoveFileEx(ToLong(path), ToLong(tmp), MOVEFILE_REPLACE_EXISTING)) return false;
+            try { File.Delete(ToLong(tmp)); return true; }
+            catch { PendDelete(tmp); return true; }
+        }
+        catch { return false; }
+    }
+
+    public static int Pended = 0;
+
+    // 登记为下次重启时删除（独占句柄的唯一彻底解法）
+    public static bool PendDelete(string path)
+    {
+        try
+        {
+            if (!Exists(path)) return true;
+            bool ok = MoveFileEx(ToLong(path), null, MOVEFILE_DELAY_UNTIL_REBOOT);
+            if (ok) Pended++;
+            return ok;
+        }
+        catch { return false; }
+    }
+
+    // 残留整树登记重启删除，返回登记数量
+    static int PendTree(string dir, Action<string> log)
+    {
+        int n = 0;
+        List<string> files = new List<string>();
+        try { files.AddRange(Directory.GetFiles(dir, "*", System.IO.SearchOption.AllDirectories)); } catch { }
+        for (int i = 0; i < files.Count; i++)
+        {
+            try { if (Exists(files[i]) && PendDelete(files[i])) n++; } catch { }
+        }
+        List<string> subs = new List<string>();
+        try { subs.AddRange(Directory.GetDirectories(dir, "*", System.IO.SearchOption.AllDirectories)); } catch { }
+        subs.Sort(delegate (string x, string y) { return y.Length - x.Length; });
+        for (int i = 0; i < subs.Count; i++)
+        {
+            try
+            {
+                if (!Directory.Exists(subs[i])) continue;
+                if (Directory.GetFileSystemEntries(subs[i]).Length == 0 && PendDelete(subs[i])) n++;
+            }
+            catch { }
+        }
+        try
+        {
+            if (Directory.Exists(dir) && Directory.GetFileSystemEntries(dir).Length == 0 && PendDelete(dir)) n++;
+        }
+        catch { }
+        return n;
+    }
+
+    // 删单个文件：直接删 → 终止占用进程 → 接管权限 → cmd 强删 → 独占句柄/改名 → 重启删除
     public static bool DeleteFile(string path, bool killLockers, Action<string> log)
     {
         if (string.IsNullOrEmpty(path)) return true;
@@ -1565,7 +1756,30 @@ static class FileForce
         if (!Exists(path)) return true;
 
         try { RunHidden("cmd.exe", "/c rd /s /q \"" + lp + "\"", 30000); } catch { }
-        return !Exists(path);
+        if (!Exists(path)) return true;
+
+        // 仍有占用：再杀一轮占用进程，然后独占句柄 / 改名绕过
+        if (KillLockers(path, log))
+        {
+            Thread.Sleep(500);
+            if (TryDelete(lp, path)) return true;
+        }
+        if (DeleteOnClose(path)) return true;
+        if (RenameThenDelete(path)) return true;
+
+        if (IsLockFile(path))
+        {
+            // 锁文件被独占时，强制再删一次并尝试关闭占用
+            try { RunHidden("cmd.exe", "/c del /f /q \"" + lp + "\"", 30000); } catch { }
+            if (!Exists(path)) return true;
+        }
+
+        if (PendDelete(path))
+        {
+            if (log != null) log("· 文件被独占占用，已登记重启后删除：" + path);
+            return true;
+        }
+        return false;
     }
 
     public static bool DeleteFile(string path)
@@ -1602,7 +1816,18 @@ static class FileForce
         }
 
         try { RunHidden("cmd.exe", "/c rd /s /q \"" + ToLong(d) + "\"", 90000); } catch { }
-        return !Directory.Exists(d);
+        if (!Directory.Exists(d)) return true;
+
+        WalkDelete(d, log);
+        if (!Directory.Exists(d)) return true;
+
+        int pend = PendTree(d, log);
+        if (pend > 0)
+        {
+            if (log != null) log("· " + pend + " 项残留被独占占用，已登记重启后删除");
+            return true;
+        }
+        return false;
     }
 
     static void WalkDelete(string dir, Action<string> log)

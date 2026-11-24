@@ -571,7 +571,494 @@ static class Uninstaller
         }
         catch { }
 
+        // 4) 深度残留清理：AppData 缓存、供应商目录、注册表、服务、计划任务、开机启动
+        try { DeepClean(a, log); }
+        catch { }
+
         log("完成：" + a.Name);
+    }
+
+    // ==================== 深度残留清理 ====================
+
+    static readonly string[] DcSkip = new string[]
+    {
+        "windows","windowsapps","microsoft","common files","packages","temp","system32","syswow64",
+        "program files","program files (x86)","users","public","default","desktop","documents","downloads",
+        "music","pictures","videos","onedrive","appdata","roaming","local","locallow","programdata",
+        "cache","caches","data","config","logs","bin","lib"
+    };
+
+    static readonly string[] DcGeneric = new string[]
+    {
+        "setup","install","installer","uninstall","unins","update","updater","launcher","launch",
+        "helper","service","client","app","application","program","tool","tools","driver","drivers",
+        "software","version","sample","test","demo","pro","free","premium","ultimate","standard",
+        "32","64","bit","x86","x64","msi","exe","win","win32","win64"
+    };
+
+    static readonly string[] DcSuffix = new string[]
+    {
+        "cache","caches","data","temp","tmp","log","logs","config","settings","updat","download",
+        "webview","crash","userdata","user data","profile","local","roaming","backup","bak",
+        "install","setup","bin","lib","dump","report","telemetry","stat","stats"
+    };
+
+    static bool DcBadName(string f)
+    {
+        if (string.IsNullOrEmpty(f)) return true;
+        string s = f.Trim().ToLower();
+        if (s.Length == 0) return true;
+        for (int i = 0; i < DcSkip.Length; i++) if (s == DcSkip[i]) return true;
+        for (int i = 0; i < DcGeneric.Length; i++) if (s == DcGeneric[i]) return true;
+        return false;
+    }
+
+    static void AddTok(List<string> list, string s)
+    {
+        if (string.IsNullOrEmpty(s)) return;
+        s = s.Trim().Trim('"', '\'', ' ', '.', '-', '_');
+        if (s.Length < 2) return;
+        if (DcBadName(s)) return;
+        for (int i = 0; i < list.Count; i++) if (string.Equals(list[i], s, StringComparison.OrdinalIgnoreCase)) return;
+        list.Add(s);
+    }
+
+    /// <summary>从软件名、发布者、安装目录、卸载程序名里提取可用于匹配残留的“关键词”。</summary>
+    static List<string> Tokens(AppInfo a)
+    {
+        List<string> t = new List<string>();
+        string name = Clean(a.Name);
+        string noBr = Regex.Replace(name, @"[(（\[【].*?[)）\]】]", " ").Trim();
+        string noVer = Regex.Replace(noBr, @"\s*(v|ver|version)?\s*\d+(\.\d+)*.*$", " ", RegexOptions.IgnoreCase).Trim();
+        string noBit = Regex.Replace(noVer, @"(64|32)[\s\-]?(bit|x64|x86)", " ", RegexOptions.IgnoreCase).Trim();
+        AddTok(t, noBit);
+        AddTok(t, noVer);
+        AddTok(t, noBr);
+        AddTok(t, name);
+
+        if (!string.IsNullOrEmpty(a.InstallLocation)) AddTok(t, Path.GetFileName(a.InstallLocation.Trim().Trim('"').TrimEnd('\\')));
+
+        string uexe = ParseExe(a.UninstallString);
+        if (uexe.Length > 0)
+        {
+            string en = Path.GetFileNameWithoutExtension(uexe);
+            string low = en.ToLower();
+            if (low.IndexOf("unins") < 0 && low.IndexOf("uninstall") < 0 && low.IndexOf("setup") < 0 &&
+                low.IndexOf("update") < 0 && low.IndexOf("inst") < 0)
+                AddTok(t, en);
+        }
+        return t;
+    }
+
+    static bool DcHit(string folder, List<string> tokens)
+    {
+        if (DcBadName(folder)) return false;
+        string f = folder.Trim().ToLower();
+        for (int i = 0; i < tokens.Count; i++)
+        {
+            string tok = tokens[i].Trim().ToLower();
+            if (tok.Length < 2 || DcBadName(tok)) continue;
+            if (f == tok) return true;
+            if (tok.Length >= 4 && f.Length > tok.Length && f.StartsWith(tok, StringComparison.Ordinal))
+            {
+                string rest = f.Substring(tok.Length);
+                char c = rest[0];
+                if (c == ' ' || c == '-' || c == '_' || c == '.' || c == '(' || c == '[' || c == '+' || c == '·')
+                    return true;
+                if (c >= '0' && c <= '9') return true;        // AppName70 / AppName 2.x
+                for (int k = 0; k < DcSuffix.Length; k++)
+                    if (rest.StartsWith(DcSuffix[k], StringComparison.Ordinal)) return true;
+            }
+        }
+        return false;
+    }
+
+    static string[] DcBases()
+    {
+        List<string> b = new List<string>();
+        string la = "";
+        try { la = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData); } catch { }
+        string ra = "";
+        try { ra = Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData); } catch { }
+        string pd = "";
+        try { pd = Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData); } catch { }
+        if (la.Length > 0) b.Add(la);
+        if (ra.Length > 0) b.Add(ra);
+        if (pd.Length > 0) b.Add(pd);
+        if (la.Length > 0)
+        {
+            b.Add(Path.Combine(Directory.GetParent(la).FullName, "LocalLow"));
+            b.Add(Path.Combine(la, "Temp"));
+            b.Add(Path.Combine(la, "Programs"));
+            b.Add(Path.Combine(la, "Packages"));
+        }
+        return b.ToArray();
+    }
+
+    static void AddPath(List<string> list, string p)
+    {
+        if (string.IsNullOrEmpty(p)) return;
+        p = p.TrimEnd('\\');
+        if (p.Length < 8) return;
+        if (p.Length <= 3) return;
+        for (int i = 0; i < list.Count; i++) if (string.Equals(list[i], p, StringComparison.OrdinalIgnoreCase)) return;
+        list.Add(p);
+    }
+
+    static void DcScanDirs(List<string> tokens, List<string> found)
+    {
+        foreach (string baseDir in DcBases())
+        {
+            if (!Directory.Exists(baseDir)) continue;
+            string[] kids;
+            try { kids = Directory.GetDirectories(baseDir); } catch { continue; }
+            for (int i = 0; i < kids.Length; i++)
+            {
+                string k = kids[i];
+                if (DcHit(Path.GetFileName(k), tokens)) { AddPath(found, k); continue; }
+                // 供应商目录（如 Tencent、Adobe）里再找一层同名子目录
+                string[] subs;
+                try { subs = Directory.GetDirectories(k); } catch { continue; }
+                for (int j = 0; j < subs.Length; j++)
+                {
+                    if (DcHit(Path.GetFileName(subs[j]), tokens)) AddPath(found, subs[j]);
+                }
+            }
+        }
+    }
+
+    static bool DcForceDelete(string path, Action<string> log)
+    {
+        for (int i = 0; i < 3; i++)
+        {
+            if (!Directory.Exists(path) && !File.Exists(path)) return true;
+            try { KillIn(path); } catch { }
+            if (Directory.Exists(path))
+            {
+                try { if (DeleteDir(path)) return true; } catch { }
+            }
+            else if (File.Exists(path))
+            {
+                try { if (FileForce.DeleteFile(path)) return true; } catch { }
+            }
+            Thread.Sleep(300);
+        }
+        return !Directory.Exists(path) && !File.Exists(path);
+    }
+
+    static void DcRegTree(RegistryKey hive, string rootPath, string sub, List<string> tokens, Action<string> log, List<string> parents)
+    {
+        if (DcBadName(sub)) return;
+        string full = rootPath.Length == 0 ? sub : rootPath + "\\" + sub;
+        try
+        {
+            hive.DeleteSubKeyTree(full, false);
+            log("· 已删除注册表键 HKEY_" + (hive == Registry.LocalMachine ? "LOCAL_MACHINE" : "CURRENT_USER") + "\\" + full);
+            if (rootPath.Length > 0) parents.Add(rootPath);
+        }
+        catch { }
+    }
+
+    static void DcCleanRegistry(List<string> tokens, Action<string> log)
+    {
+        List<string> parents = new List<string>();
+        RegistryKey[] hives = new RegistryKey[] { Registry.CurrentUser, Registry.LocalMachine };
+        string[] roots = new string[] { "Software", "Software\\WOW6432Node" };
+        for (int h = 0; h < hives.Length; h++)
+        {
+            for (int r = 0; r < roots.Length; r++)
+            {
+                RegistryKey key = null;
+                try { key = hives[h].OpenSubKey(roots[r]); } catch { }
+                if (key == null) continue;
+                string[] names = key.GetSubKeyNames();
+                key.Close();
+                for (int i = 0; i < names.Length; i++)
+                {
+                    string n = names[i];
+                    if (DcHit(n, tokens)) { DcRegTree(hives[h], roots[r], n, tokens, log, parents); continue; }
+                    RegistryKey sub = null;
+                    try { sub = hives[h].OpenSubKey(roots[r] + "\\" + n); } catch { }
+                    if (sub == null) continue;
+                    string[] subs = sub.GetSubKeyNames();
+                    sub.Close();
+                    for (int j = 0; j < subs.Length; j++)
+                    {
+                        if (DcHit(subs[j], tokens)) DcRegTree(hives[h], roots[r] + "\\" + n, subs[j], tokens, log, parents);
+                    }
+                }
+            }
+        }
+        // 清掉因删除而变空的厂商级父键（例如 HKCU\Software\Tencent）
+        for (int h = 0; h < hives.Length; h++)
+        {
+            for (int p = 0; p < parents.Count; p++)
+            {
+                try
+                {
+                    RegistryKey k = hives[h].OpenSubKey(parents[p]);
+                    if (k == null) continue;
+                    bool empty = k.SubKeyCount == 0 && k.ValueCount == 0;
+                    k.Close();
+                    if (!empty) continue;
+                    hives[h].DeleteSubKey(parents[p], false);
+                    log("· 已清除空注册表键 " + parents[p]);
+                }
+                catch { }
+            }
+        }
+    }
+
+    static void DcCleanRun(List<string> tokens, string[] dirs, Action<string> log)
+    {
+        string[] paths = new string[]
+        {
+            @"Software\Microsoft\Windows\CurrentVersion\Run",
+            @"Software\Microsoft\Windows\CurrentVersion\RunOnce",
+            @"Software\Wow6432Node\Microsoft\Windows\CurrentVersion\Run"
+        };
+        for (int p = 0; p < paths.Length; p++)
+        {
+            for (int h = 0; h < 2; h++)
+            {
+                RegistryKey hive = h == 0 ? Registry.CurrentUser : Registry.LocalMachine;
+                RegistryKey k = null;
+                try { k = hive.OpenSubKey(paths[p], true); } catch { }
+                if (k == null) continue;
+                string[] names = k.GetValueNames();
+                for (int i = 0; i < names.Length; i++)
+                {
+                    string vname = names[i];
+                    string data = "";
+                    try { object o = k.GetValue(vname); data = o == null ? "" : o.ToString(); } catch { }
+                    bool hit = DcHit(vname, tokens);
+                    if (!hit && data.Length > 0)
+                    {
+                        for (int d = 0; d < dirs.Length; d++)
+                        {
+                            if (dirs[d].Length > 6 && data.IndexOf(dirs[d], StringComparison.OrdinalIgnoreCase) >= 0) { hit = true; break; }
+                        }
+                    }
+                    if (hit)
+                    {
+                        try { k.DeleteValue(vname, false); log("· 已移除开机启动项 " + vname); } catch { }
+                    }
+                }
+                k.Close();
+            }
+        }
+    }
+
+    static void DcCleanServices(string[] dirs, List<string> tokens, Action<string> log)
+    {
+        RegistryKey svc = null;
+        try { svc = Registry.LocalMachine.OpenSubKey(@"SYSTEM\CurrentControlSet\Services"); } catch { }
+        if (svc == null) return;
+        string[] names = svc.GetSubKeyNames();
+        svc.Close();
+        for (int i = 0; i < names.Length; i++)
+        {
+            string n = names[i];
+            string img = "";
+            RegistryKey k = null;
+            try { k = Registry.LocalMachine.OpenSubKey(@"SYSTEM\CurrentControlSet\Services\" + n); } catch { }
+            if (k != null)
+            {
+                try { object o = k.GetValue("ImagePath"); img = o == null ? "" : o.ToString(); } catch { }
+                k.Close();
+            }
+            if (img.Length == 0) continue;
+            bool hit = false;
+            for (int d = 0; d < dirs.Length; d++)
+            {
+                if (dirs[d].Length > 6 && img.IndexOf(dirs[d], StringComparison.OrdinalIgnoreCase) >= 0) { hit = true; break; }
+            }
+            if (!hit)
+            {
+                string exe = ParseExe(img.Replace("\"", ""));
+                if (exe.Length > 4)
+                {
+                    string en = Path.GetFileNameWithoutExtension(exe);
+                    if (en.Length >= 2 && DcHit(en, tokens)) hit = true;
+                }
+            }
+            if (!hit) continue;
+            Run("sc.exe", "stop \"" + n + "\"", 20000, false);
+            bool ok = Run("sc.exe", "delete \"" + n + "\"", 30000, false);
+            log("· 删除服务 " + n + (ok ? "（已执行 sc delete）" : "（sc delete 失败，请手动检查）"));
+        }
+    }
+
+    static void DcCleanTasks(string[] dirs, Action<string> log)
+    {
+        string win = "";
+        try { win = Environment.GetFolderPath(Environment.SpecialFolder.Windows); } catch { }
+        if (win.Length == 0) return;
+        string tasks = Path.Combine(Path.Combine(win, "System32"), "Tasks");
+        if (!Directory.Exists(tasks)) return;
+        string[] files;
+        try { files = Directory.GetFiles(tasks, "*", System.IO.SearchOption.AllDirectories); } catch { return; }
+        for (int i = 0; i < files.Length; i++)
+        {
+            string txt = "";
+            try { txt = File.ReadAllText(files[i]); } catch { continue; }
+            bool hit = false;
+            for (int d = 0; d < dirs.Length; d++)
+            {
+                if (dirs[d].Length > 6 && txt.IndexOf(dirs[d], StringComparison.OrdinalIgnoreCase) >= 0) { hit = true; break; }
+            }
+            if (!hit) continue;
+            string tn = files[i].Substring(tasks.Length).TrimStart('\\');
+            Run("schtasks.exe", "/delete /tn \"" + tn + "\" /f", 30000, false);
+            log("· 删除计划任务 " + tn);
+        }
+    }
+
+    static void DcCleanStartupLnk(List<string> tokens, Action<string> log)
+    {
+        string[] folders = new string[]
+        {
+            Environment.GetFolderPath(Environment.SpecialFolder.Startup),
+            Environment.GetFolderPath(Environment.SpecialFolder.CommonStartup)
+        };
+        for (int f = 0; f < folders.Length; f++)
+        {
+            string folder = folders[f];
+            if (string.IsNullOrEmpty(folder) || !Directory.Exists(folder)) continue;
+            string[] files;
+            try { files = Directory.GetFiles(folder, "*.lnk"); } catch { continue; }
+            for (int i = 0; i < files.Length; i++)
+            {
+                string nm = Path.GetFileNameWithoutExtension(files[i]);
+                if (!DcHit(nm, tokens)) continue;
+                try { File.Delete(files[i]); log("· 删除启动项快捷方式 " + nm); } catch { }
+            }
+        }
+    }
+
+    /// <summary>删完目标目录后，把变空的厂商级父目录（如 %APPDATA%\Tencent）一并清掉。</summary>
+    static void DcPruneEmpty(List<string> targets, Action<string> log)
+    {
+        string[] bases = DcBases();
+        for (int b = 0; b < bases.Length; b++) bases[b] = bases[b].TrimEnd('\\').ToLower();
+
+        for (int i = 0; i < targets.Count; i++)
+        {
+            string p = targets[i].TrimEnd('\\');
+            for (int up = 0; up < 2; up++)
+            {
+                string parent = Path.GetDirectoryName(p);
+                if (parent == null) break;
+                parent = parent.TrimEnd('\\');
+                bool inBase = false;
+                for (int b = 0; b < bases.Length; b++)
+                {
+                    if (parent.ToLower() == bases[b]) { inBase = true; break; }
+                }
+                if (inBase) break;
+                if (!Directory.Exists(parent)) break;
+                string[] files = null;
+                string[] subs = null;
+                try { files = Directory.GetFiles(parent); subs = Directory.GetDirectories(parent); } catch { break; }
+                if (files.Length > 0 || subs.Length > 0) break;
+                try
+                {
+                    Directory.Delete(parent, true);
+                    log("· 已清除空目录 " + parent);
+                }
+                catch { break; }
+                p = parent;
+            }
+        }
+    }
+
+    /// <summary>清除变成空壳的注册表键（如软件卸载后残留的厂商键）。</summary>
+    static void DcPruneEmptyReg(List<string> tokens, Action<string> log)
+    {
+        RegistryKey[] hives = new RegistryKey[] { Registry.CurrentUser, Registry.LocalMachine };
+        string[] roots = new string[] { "Software", "Software\\WOW6432Node" };
+        for (int h = 0; h < hives.Length; h++)
+        {
+            for (int r = 0; r < roots.Length; r++)
+            {
+                RegistryKey key = null;
+                try { key = hives[h].OpenSubKey(roots[r]); } catch { }
+                if (key == null) continue;
+                string[] names = key.GetSubKeyNames();
+                key.Close();
+                for (int i = 0; i < names.Length; i++)
+                {
+                    if (!DcHit(names[i], tokens)) continue;
+                    RegistryKey sub = null;
+                    try { sub = hives[h].OpenSubKey(roots[r] + "\\" + names[i]); } catch { }
+                    if (sub == null) continue;
+                    bool empty = sub.SubKeyCount == 0 && sub.ValueCount == 0;
+                    sub.Close();
+                    if (!empty) continue;
+                    try
+                    {
+                        hives[h].DeleteSubKey(roots[r] + "\\" + names[i], false);
+                        log("· 已清除空注册表键 " + names[i]);
+                    }
+                    catch { }
+                }
+            }
+        }
+    }
+
+    /// <summary>深度清理：安装目录 + AppData 缓存 + 注册表 + 服务 + 计划任务 + 开机启动。返回清理的目录数。</summary>
+    public static int DeepClean(AppInfo a, Action<string> log)
+    {
+        List<string> tokens = Tokens(a);
+        string dir = a.InstallLocation == null ? "" : a.InstallLocation.Trim().Trim('"').TrimEnd('\\');
+        string uexe = ParseExe(a.UninstallString);
+
+        List<string> dirs = new List<string>();
+        if (dir.Length > 6) AddPath(dirs, dir);
+        if (uexe.Length > 6)
+        {
+            string ed = Path.GetDirectoryName(uexe);
+            if (ed != null && ed.Length > 6) AddPath(dirs, ed);
+        }
+
+        // 目标目录：安装目录 + AppData 系列缓存
+        List<string> targets = new List<string>();
+        if (!a.Protected)
+        {
+            for (int i = 0; i < dirs.Count; i++)
+                if (Directory.Exists(dirs[i])) AddPath(targets, dirs[i]);
+            if (tokens.Count > 0) DcScanDirs(tokens, targets);
+        }
+
+        if (targets.Count > 0) log("· 深度清理：找到 " + targets.Count + " 个残留目录");
+        int okCount = 0;
+        for (int i = 0; i < targets.Count; i++)
+        {
+            string p = targets[i];
+            bool ok = DcForceDelete(p, log);
+            if (ok) { okCount++; log("· 已删除 " + p); }
+            else log("× 删除失败（可能仍被占用）：" + p);
+        }
+        DcPruneEmpty(targets, log);
+
+        // 卸载后残留空注册表父键（如 HKCU\Software\<厂商>）
+        DcPruneEmptyReg(tokens, log);
+
+        DcCleanRegistry(tokens, log);
+        DcCleanRun(tokens, dirs.ToArray(), log);
+        DcCleanStartupLnk(tokens, log);
+        if (!a.Protected)
+        {
+            DcCleanServices(dirs.ToArray(), tokens, log);
+            DcCleanTasks(dirs.ToArray(), log);
+        }
+
+        // 校验是否还有残留
+        int left = 0;
+        for (int i = 0; i < targets.Count; i++)
+            if (Directory.Exists(targets[i])) { left++; log("· 仍残留（可重启后再删）：" + targets[i]); }
+        if (left == 0 && targets.Count > 0) log("· 残留目录已全部清除");
+        return okCount;
     }
 }
 
@@ -2229,7 +2716,14 @@ class MainForm : Form
             if (!string.IsNullOrEmpty(a.InstallLocation)) sb.AppendLine("     目录：" + a.InstallLocation);
         }
         sb.AppendLine();
-        sb.AppendLine("流程：先静默调用卸载程序，成功后继续清理安装目录、开始菜单/桌面快捷方式、注册表卸载项及残留数据。");
+        sb.AppendLine("流程：先静默调用卸载程序，然后做深度残留清理：");
+        sb.AppendLine("  ① 安装目录与卸载程序目录（含被占用文件强制删除、失败自动重试）");
+        sb.AppendLine("  ② %LocalAppData% / %AppData% / %LocalLow% / %ProgramData% / Temp 下同名及厂商目录内的同名缓存");
+        sb.AppendLine("  ③ 注册表 HKCU/HKLM\\Software 下同名、厂商目录内的同名子键，以及空壳父键");
+        sb.AppendLine("  ④ 开机启动项（Run / RunOnce / 启动文件夹快捷方式）");
+        sb.AppendLine("  ⑤ 指向安装目录的系统服务（sc stop + sc delete）");
+        sb.AppendLine("  ⑥ 引用安装目录的计划任务（schtasks /delete）");
+        sb.AppendLine("  ⑦ 开始菜单、桌面等位置的快捷方式");
         sb.AppendLine("该操作不可撤销，请确认无误后继续。");
 
         if (MessageBox.Show(sb.ToString(), "确认卸载", MessageBoxButtons.OKCancel, MessageBoxIcon.Warning, MessageBoxDefaultButton.Button2) != DialogResult.OK)
@@ -2654,3 +3148,5 @@ static class Program
         Application.Run(new MainForm());
     }
 }
+
+

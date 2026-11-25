@@ -2151,7 +2151,7 @@ class ScanResult
 {
     public List<DocItem> Files = new List<DocItem>();
     public List<FolderItem> Folders = new List<FolderItem>();
-    // 命中扫描上限（文件 200 万 / 文件夹 150 万）时为 true，结果不完整
+    // 仅当内存耗尽被提前中断时为 true（不设数量上限）
     public bool Truncated = false;
 }
 
@@ -2210,8 +2210,7 @@ static class DocScanner
     // 重解析点（junction / 软链 / 云盘占位目录）照常进入，靠卷序列号 + 文件索引去重，
     // 既避免 C:\Users\All Users -> C:\ProgramData 这类循环，又不漏 OneDrive 等目录。
     // 长路径统一加 \\?\ 前缀，超过 260 字符的目录也能枚举。
-    const int MaxFiles = 2000000;
-    const int MaxFolders = 1500000;
+    // 不设文件/目录数量上限；只有内存耗尽时才会提前结束（结果标为不完整）
     const int MaxDepth = 200;
 
     static bool NoiseDir(string dir)
@@ -2320,11 +2319,14 @@ static class DocScanner
             res.Folders.Add(rootItem);
 
             DirKey rk;
-            if (!DirKeyOf(r, out rk) || seen.Add(rk))
-                Walk(r, res, seen, progress, cancelled);
-
-            if (res.Files.Count >= MaxFiles || res.Folders.Count >= MaxFolders)
+            try
             {
+                if (!DirKeyOf(r, out rk) || seen.Add(rk))
+                    Walk(r, res, seen, progress, cancelled);
+            }
+            catch (OutOfMemoryException)
+            {
+                // 不设数量上限；只有内存真的耗尽时才停，并保留已扫到的部分
                 res.Truncated = true;
                 break;
             }
@@ -2434,7 +2436,6 @@ static class DocScanner
 
         while (stack.Count > 0)
         {
-            if (res.Files.Count >= MaxFiles || res.Folders.Count >= MaxFolders) { res.Truncated = true; return; }
             if (cancelled != null && cancelled()) return;
 
             WalkNode cur = stack.Pop();
@@ -4066,7 +4067,7 @@ class MainForm : Form
                     vFolders.Dirty = true;
                     if (res.Truncated)
                     {
-                        string w = "已达扫描上限（" + res.Files.Count + " 文件 / " + res.Folders.Count + " 文件夹），结果不完整";
+                        string w = "内存不足，扫描提前结束（已保留 " + res.Files.Count + " 文件 / " + res.Folders.Count + " 文件夹）";
                         vDocs.State.Text = w;
                         vImages.State.Text = w;
                         vVideos.State.Text = w;

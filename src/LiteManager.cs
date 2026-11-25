@@ -136,9 +136,14 @@ static class AppLoader
                         if (wi != null && Convert.ToInt32(wi) == 1) a.IsMSI = true;
                         if (a.UninstallString.ToLower().Contains("msiexec")) a.IsMSI = true;
 
-                        if (a.InstallLocation.StartsWith(@"C:\Windows", StringComparison.OrdinalIgnoreCase) ||
-                            a.InstallLocation.StartsWith(@"C:\WINDOWS", StringComparison.OrdinalIgnoreCase))
-                            a.Protected = true;
+                        if (a.InstallLocation.Length > 0)
+                        {
+                            string winDir = "";
+                            try { winDir = Environment.GetFolderPath(Environment.SpecialFolder.Windows); } catch { }
+                            if (winDir.Length > 3 &&
+                                a.InstallLocation.TrimEnd('\\').ToLower().StartsWith(winDir.TrimEnd('\\').ToLower() + "\\"))
+                                a.Protected = true;
+                        }
 
                         if (a.Publisher.ToLower().Contains("microsoft") && a.Name.ToLower().Contains("microsoft"))
                             a.Protected = true;
@@ -378,8 +383,8 @@ static class Uninstaller
 
     public static void KillIn(string dir)
     {
-        if (string.IsNullOrEmpty(dir) || dir.Length < 8) return;
-        dir = dir.TrimEnd('\\');
+        if (string.IsNullOrEmpty(dir) || dir.Length < 5) return;
+        dir = dir.TrimEnd('\\') + "\\";
         List<Process> ps = new List<Process>();
         foreach (Process p in Process.GetProcesses())
         {
@@ -406,7 +411,7 @@ static class Uninstaller
 
     public static bool DeleteDir(string dir)
     {
-        if (string.IsNullOrEmpty(dir) || dir.Length < 8) return false;
+        if (string.IsNullOrEmpty(dir) || dir.Length < 5) return false;
         string d = dir.TrimEnd('\\');
         if (!Directory.Exists(d)) return true;
         return FileForce.DeleteTree(d, null);
@@ -535,7 +540,7 @@ static class Uninstaller
     {
         string clean = (name == null ? "" : name.Trim());
         string dir = (installDir == null ? "" : installDir.Trim().Trim('"').TrimEnd('\\'));
-        if (dir.Length < 6) dir = "";
+        if (dir.Length < 5) dir = "";
         if (clean.Length < 2 && dir.Length == 0) return;
         string lc = clean.ToLower();
         string dl = dir.ToLower();
@@ -745,16 +750,23 @@ static class Uninstaller
             }
         }
 
-        DeleteShortcuts(a.Name, dir, log);
-        DeleteAppDataLeftovers(a);
-
-        try
+        // 系统组件（Windows/Microsoft 自家程序）只跑官方卸载，不碰快捷方式、数据目录与注册表项
+        if (!a.Protected)
         {
-            RegistryKey root = a.Hive == "HKLM" ? Registry.LocalMachine : Registry.CurrentUser;
-            root.DeleteSubKeyTree(a.RegPath, false);
-            log("· 已清除注册表卸载项");
+            DeleteShortcuts(a.Name, dir, log);
+            DeleteAppDataLeftovers(a);
         }
-        catch { }
+
+        if (!a.Protected)
+        {
+            try
+            {
+                RegistryKey root = a.Hive == "HKLM" ? Registry.LocalMachine : Registry.CurrentUser;
+                root.DeleteSubKeyTree(a.RegPath, false);
+                log("· 已清除注册表卸载项");
+            }
+            catch { }
+        }
 
         // 4) 深度残留清理：AppData 缓存、供应商目录、注册表、服务、计划任务、开机启动
         try { DeepClean(a, log); }
@@ -1045,15 +1057,48 @@ static class Uninstaller
             b.Add(Path.Combine(la, "Programs"));
             b.Add(Path.Combine(la, "Packages"));
         }
+        // 多用户机器：其他账户的 AppData 与用户根也纳入扫描（无权限时自动跳过）
+        try { AddOtherProfileBases(b, Environment.GetFolderPath(Environment.SpecialFolder.UserProfile)); } catch { }
         return b.ToArray();
+    }
+
+    static void AddOtherProfileBases(List<string> b, string currentUp)
+    {
+        if (string.IsNullOrEmpty(currentUp)) return;
+        string usersRoot = "";
+        try { usersRoot = Directory.GetParent(currentUp).FullName; } catch { return; }
+        if (string.IsNullOrEmpty(usersRoot) || !Directory.Exists(usersRoot)) return;
+        string[] profs;
+        try { profs = Directory.GetDirectories(usersRoot); } catch { return; }
+        for (int i = 0; i < profs.Length; i++)
+        {
+            string p = profs[i];
+            string nm = Path.GetFileName(p).ToLower();
+            if (nm == "public" || nm == "default" || nm == "default user" || nm == "all users" ||
+                nm.StartsWith("defaultuser") || nm.StartsWith("default.")) continue;
+            if (string.Equals(p.TrimEnd('\\'), currentUp.TrimEnd('\\'), StringComparison.OrdinalIgnoreCase)) continue;
+            if (DcIsLink(p)) continue;
+            string roaming = Path.Combine(p, @"AppData\Roaming");
+            string local = Path.Combine(p, @"AppData\Local");
+            string low = Path.Combine(p, @"AppData\LocalLow");
+            if (Directory.Exists(roaming)) b.Add(roaming);
+            if (Directory.Exists(local))
+            {
+                b.Add(local);
+                b.Add(Path.Combine(local, "Temp"));
+                b.Add(Path.Combine(local, "Programs"));
+                b.Add(Path.Combine(local, "Packages"));
+            }
+            if (Directory.Exists(low)) b.Add(low);
+            b.Add(p);
+        }
     }
 
     static void AddPath(List<string> list, string p)
     {
         if (string.IsNullOrEmpty(p)) return;
         p = p.TrimEnd('\\');
-        if (p.Length < 8) return;
-        if (p.Length <= 3) return;
+        if (p.Length < 5) return;          // 至少 C:\ab，短路径在非系统盘上很常见
         for (int i = 0; i < list.Count; i++) if (string.Equals(list[i], p, StringComparison.OrdinalIgnoreCase)) return;
         list.Add(p);
     }
@@ -1152,9 +1197,8 @@ static class Uninstaller
         }
         try
         {
-            string pd = Environment.GetEnvironmentVariable("ProgramData");
-            if (string.IsNullOrEmpty(pd)) pd = @"C:\ProgramData";
-            roots.Add(pd);
+            string pd = Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData);
+            if (!string.IsNullOrEmpty(pd)) roots.Add(pd);
         }
         catch { }
         try { roots.Add(Path.GetTempPath()); } catch { }
@@ -1347,7 +1391,7 @@ static class Uninstaller
                     {
                         for (int d = 0; d < dirs.Length; d++)
                         {
-                            if (dirs[d].Length > 6 && data.IndexOf(dirs[d], StringComparison.OrdinalIgnoreCase) >= 0) { hit = true; break; }
+                            if (dirs[d].Length >= 5 && data.IndexOf(dirs[d], StringComparison.OrdinalIgnoreCase) >= 0) { hit = true; break; }
                         }
                     }
                     if (hit)
@@ -1422,7 +1466,7 @@ static class Uninstaller
             bool hit = false;
             for (int d = 0; d < dirs.Length; d++)
             {
-                if (dirs[d].Length > 6 && txt.IndexOf(dirs[d], StringComparison.OrdinalIgnoreCase) >= 0) { hit = true; break; }
+                if (dirs[d].Length >= 5 && txt.IndexOf(dirs[d], StringComparison.OrdinalIgnoreCase) >= 0) { hit = true; break; }
             }
             if (!hit) continue;
             string tn = files[i].Substring(tasks.Length).TrimStart('\\');
@@ -1533,11 +1577,11 @@ static class Uninstaller
         string uexe = ParseExe(a.UninstallString);
 
         List<string> dirs = new List<string>();
-        if (dir.Length > 6) AddPath(dirs, dir);
-        if (uexe.Length > 6)
+        if (dir.Length >= 5) AddPath(dirs, dir);
+        if (uexe.Length >= 5)
         {
             string ed = Path.GetDirectoryName(uexe);
-            if (ed != null && ed.Length > 6) AddPath(dirs, ed);
+            if (ed != null && ed.Length >= 5) AddPath(dirs, ed);
         }
         // 关键安全阀：安装目录若登记成 C:\Program Files 这种公共目录，绝不能拿去匹配服务/任务/删除
         for (int i = dirs.Count - 1; i >= 0; i--)
@@ -2359,14 +2403,6 @@ class MainForm : Form
         BuildUI();
         Load += delegate
         {
-            string test = Environment.GetEnvironmentVariable("LM_TEST");
-            if (test == "docs") tabs.SelectedIndex = 2;
-            else if (test == "rogue") tabs.SelectedIndex = 1;
-            else if (test == "images") tabs.SelectedIndex = 3;
-            else if (test == "videos") tabs.SelectedIndex = 4;
-            else if (test == "archives") tabs.SelectedIndex = 5;
-            else if (test == "folders") tabs.SelectedIndex = 6;
-
             RefreshApps();
 
             // 打开软件后自动全盘扫描

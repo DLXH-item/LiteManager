@@ -2151,6 +2151,8 @@ class ScanResult
 {
     public List<DocItem> Files = new List<DocItem>();
     public List<FolderItem> Folders = new List<FolderItem>();
+    // 命中扫描上限（文件 200 万 / 文件夹 150 万）时为 true，结果不完整
+    public bool Truncated = false;
 }
 
 static class DocScanner
@@ -2201,29 +2203,94 @@ static class DocScanner
         return m;
     }
 
-    static readonly string[] SkipNames = new string[]
-    {
-        "windows", "program files", "program files (x86)", "programdata", "$recycle.bin",
-        "system volume information", "appdata", "node_modules", ".git", "windowsapps",
-        "winsxs", "assembly", "installer", "temp", "tmp", "cache",
-        "recovery", "$winreagent", "msocache", "config.msi", "perflogs", "windows.old",
-        "driverstore", "softwaredistribution", "package cache", "packages"
-    };
+    // —— 全盘扫描（v2.4 全量版）
+    // 只排除回收站和系统卷信息（无实际内容且常无权限）。
+    // 不再按名字跳过 AppData / Temp / cache / node_modules / .git / ProgramData / Windows 等目录，
+    // 也不会因为“某个子目录读属性失败”就丢掉整棵子树。
+    // 重解析点（junction / 软链 / 云盘占位目录）照常进入，靠卷序列号 + 文件索引去重，
+    // 既避免 C:\Users\All Users -> C:\ProgramData 这类循环，又不漏 OneDrive 等目录。
+    // 长路径统一加 \\?\ 前缀，超过 260 字符的目录也能枚举。
+    const int MaxFiles = 2000000;
+    const int MaxFolders = 1500000;
+    const int MaxDepth = 200;
 
-    static bool Skip(string dir)
+    static bool NoiseDir(string dir)
     {
-        string n = Path.GetFileName(dir).ToLower();
-        foreach (string s in SkipNames) if (n == s) return true;
-        if (n.StartsWith(".") && n.Length > 1) return true;
-        try
-        {
-            if ((File.GetAttributes(dir) & FileAttributes.ReparsePoint) != 0) return true;
-        }
-        catch { return true; }
-        return false;
+        string n = Path.GetFileName(dir.TrimEnd('\\')).ToLowerInvariant();
+        return n == "$recycle.bin" || n == "system volume information" || n == "recycler";
     }
 
-    /// <summary>全盘扫描所有固定磁盘：文件 + 文件夹。</summary>
+    static string Lp(string p)
+    {
+        if (p.StartsWith(@"\\?\")) return p;
+        if (p.StartsWith(@"\\")) return @"\\?\UNC\" + p.Substring(2);
+        return @"\\?\" + p;
+    }
+
+    static string UnLp(string p)
+    {
+        if (p.StartsWith(@"\\?\UNC\")) return @"\\" + p.Substring(8);
+        if (p.StartsWith(@"\\?\")) return p.Substring(4);
+        return p;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    struct ByHandle
+    {
+        public uint Attr;
+        public uint CTimeLow, CTimeHigh;
+        public uint ATimeLow, ATimeHigh;
+        public uint WTimeLow, WTimeHigh;
+        public uint Vol;
+        public uint SizeHigh, SizeLow;
+        public uint Links;
+        public uint IdxHigh, IdxLow;
+    }
+
+    public struct DirKey
+    {
+        public ulong Vol;
+        public ulong Idx;
+        public override int GetHashCode()
+        {
+            return (int)((Vol * 2654435761UL) ^ Idx ^ (Idx >> 32));
+        }
+        public override bool Equals(object o)
+        {
+            if (!(o is DirKey)) return false;
+            DirKey k = (DirKey)o;
+            return k.Vol == Vol && k.Idx == Idx;
+        }
+    }
+
+    struct WalkNode
+    {
+        public string Path;
+        public int Depth;
+    }
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    static extern IntPtr CreateFileW(string name, uint access, uint share, IntPtr sec, uint disp, uint flags, IntPtr tmpl);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    static extern bool GetFileInformationByHandle(IntPtr h, out ByHandle info);
+    [DllImport("kernel32.dll")]
+    static extern bool CloseHandle(IntPtr h);
+
+    static bool DirKeyOf(string dir, out DirKey key)
+    {
+        key = new DirKey();
+        IntPtr h = CreateFileW(Lp(dir), 0, 7, IntPtr.Zero, 3, 0x02000000, IntPtr.Zero);
+        if (h == IntPtr.Zero || h == new IntPtr(-1)) return false;
+        ByHandle bi;
+        bool ok = GetFileInformationByHandle(h, out bi);
+        CloseHandle(h);
+        if (!ok) return false;
+        key.Vol = bi.Vol;
+        key.Idx = ((ulong)bi.IdxHigh << 32) | bi.IdxLow;
+        return true;
+    }
+
+    /// <summary>全盘扫描所有就绪的固定盘和移动盘：文件 + 文件夹。</summary>
     public static ScanResult Scan(Action<int, int> progress, Func<bool> cancelled)
     {
         List<string> roots = new List<string>();
@@ -2231,19 +2298,20 @@ static class DocScanner
         {
             try
             {
-                if (dr.DriveType == DriveType.Fixed && dr.IsReady) roots.Add(dr.RootDirectory.FullName);
+                DriveType t = dr.DriveType;
+                if (t != DriveType.Fixed && t != DriveType.Removable) continue;
+                if (!dr.IsReady || dr.RootDirectory == null) continue;
+                roots.Add(dr.RootDirectory.FullName);
             }
             catch { }
         }
 
         ScanResult res = new ScanResult();
-        HashSet<string> seenRoot = new HashSet<string>();
+        HashSet<DirKey> seen = new HashSet<DirKey>();
         foreach (string r in roots)
         {
             if (string.IsNullOrEmpty(r)) continue;
-            string key = r.ToLower();
-            if (seenRoot.Contains(key)) continue;
-            seenRoot.Add(key);
+            if (cancelled != null && cancelled()) break;
             if (!Directory.Exists(r)) continue;
 
             FolderItem rootItem = new FolderItem();
@@ -2251,68 +2319,181 @@ static class DocScanner
             rootItem.Name = r.TrimEnd('\\');
             res.Folders.Add(rootItem);
 
-            Walk(r, res, progress, cancelled);
-            if (res.Files.Count > 300000 || res.Folders.Count > 200000) break;
-            if (cancelled != null && cancelled()) break;
+            DirKey rk;
+            if (!DirKeyOf(r, out rk) || seen.Add(rk))
+                Walk(r, res, seen, progress, cancelled);
+
+            if (res.Files.Count >= MaxFiles || res.Folders.Count >= MaxFolders)
+            {
+                res.Truncated = true;
+                break;
+            }
         }
+
         res.Files.Sort(delegate (DocItem x, DocItem y) { return string.Compare(x.Name, y.Name, StringComparison.OrdinalIgnoreCase); });
         res.Folders.Sort(delegate (FolderItem x, FolderItem y) { return string.Compare(x.Path, y.Path, StringComparison.OrdinalIgnoreCase); });
         return res;
     }
 
-    static void Walk(string root, ScanResult res, Action<int, int> progress, Func<bool> cancelled)
+    // 用 Win32 FindFirstFile 自己枚举：.NET 4.0 的 Directory.GetFiles 不接受 \\?\ 长路径，
+    // 且遇到单个异常条目会整目录失败。逐条返回后，单个坏条目/无权限子目录不会连累兄弟目录。
+    struct Entry
     {
-        Stack<string> stack = new Stack<string>();
-        stack.Push(root);
+        public string Name;
+        public uint Attr;
+        public uint SizeHigh;
+        public uint SizeLow;
+        public uint WLow;
+        public uint WHigh;
+    }
+
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    struct FindData
+    {
+        public uint Attr;
+        public uint CTimeLow, CTimeHigh;
+        public uint ATimeLow, ATimeHigh;
+        public uint WTimeLow, WTimeHigh;
+        public uint SizeHigh, SizeLow;
+        public uint Reserved0, Reserved1;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 260)] public string Name;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 14)] public string AltName;
+    }
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    static extern IntPtr FindFirstFileW(string pattern, out FindData data);
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    static extern bool FindNextFileW(IntPtr h, out FindData data);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    static extern bool FindClose(IntPtr h);
+
+    const uint ATTR_DIR = 0x10;
+    const uint ATTR_REPARSE = 0x400;
+
+    // 这些是系统为兼容旧程序建的 junction（如 AppData\Local\Application Data -> AppData\Local），
+    // 目标目录本身会被单独扫到，跳过它们可避免“别名先到、真身反被去重”而漏内容。
+    static readonly string[] LegacyLinks = new string[]
+    {
+        "application data", "local settings", "my documents", "my music", "my pictures",
+        "my videos", "my games", "nethood", "net hood", "printhood", "print hood",
+        "recent", "sendto", "start menu", "templates", "cookies",
+        "documents and settings", "all users", "default user", "default"
+    };
+
+    static bool LegacyLink(string name)
+    {
+        string n = name.ToLowerInvariant();
+        for (int i = 0; i < LegacyLinks.Length; i++) if (n == LegacyLinks[i]) return true;
+        return false;
+    }
+
+    static string Join(string dir, string name)
+    {
+        if (dir.EndsWith("\\")) return dir + name;
+        return dir + "\\" + name;
+    }
+
+    static void ReadDir(string dir, List<Entry> subs, List<Entry> files)
+    {
+        string pat = Lp(dir);
+        if (!pat.EndsWith("\\")) pat += "\\";
+        pat += "*";
+        FindData fd;
+        IntPtr h = FindFirstFileW(pat, out fd);
+        if (h == IntPtr.Zero || h == new IntPtr(-1)) return;
+        try
+        {
+            while (true)
+            {
+                string nm = fd.Name;
+                if (nm != "." && nm != "..")
+                {
+                    Entry e = new Entry();
+                    e.Name = nm;
+                    e.Attr = fd.Attr;
+                    e.SizeHigh = fd.SizeHigh;
+                    e.SizeLow = fd.SizeLow;
+                    e.WLow = fd.WTimeLow;
+                    e.WHigh = fd.WTimeHigh;
+                    if ((fd.Attr & ATTR_DIR) != 0) subs.Add(e); else files.Add(e);
+                }
+                if (!FindNextFileW(h, out fd)) break;
+            }
+        }
+        finally { FindClose(h); }
+    }
+
+    internal static void Walk(string root, ScanResult res, HashSet<DirKey> seen, Action<int, int> progress, Func<bool> cancelled)
+    {
+        Stack<WalkNode> stack = new Stack<WalkNode>();
+        WalkNode n0;
+        n0.Path = root;
+        n0.Depth = 0;
+        stack.Push(n0);
         int tick = 0;
+
         while (stack.Count > 0)
         {
-            if (res.Files.Count > 300000 || res.Folders.Count > 200000) return;
+            if (res.Files.Count >= MaxFiles || res.Folders.Count >= MaxFolders) { res.Truncated = true; return; }
             if (cancelled != null && cancelled()) return;
-            string dir = stack.Pop();
 
-            string[] subs = null;
-            try { subs = Directory.GetDirectories(dir); } catch { subs = null; }
-            if (subs != null)
+            WalkNode cur = stack.Pop();
+            string dir = cur.Path;
+
+            List<Entry> subs = new List<Entry>();
+            List<Entry> fs = new List<Entry>();
+            ReadDir(dir, subs, fs);
+
+            for (int i = 0; i < subs.Count; i++)
             {
-                foreach (string s in subs)
+                Entry e = subs[i];
+                string s = Join(dir, e.Name);
+                if (NoiseDir(s)) continue;
+
+                FolderItem fi = new FolderItem();
+                fi.Path = s;
+                fi.Name = e.Name;
+                res.Folders.Add(fi);
+
+                if (cur.Depth + 1 > MaxDepth) continue;
+                if ((e.Attr & ATTR_REPARSE) != 0 && LegacyLink(e.Name)) continue;
+
+                DirKey k;
+                if (DirKeyOf(s, out k))
                 {
-                    try
-                    {
-                        if (Skip(s)) continue;
-                        FolderItem fi = new FolderItem();
-                        fi.Path = s;
-                        fi.Name = Path.GetFileName(s.TrimEnd('\\'));
-                        if (string.IsNullOrEmpty(fi.Name)) fi.Name = s;
-                        res.Folders.Add(fi);
-                        stack.Push(s);
-                    }
-                    catch { }
+                    // 同一个真实目录已经扫过（junction/软链/多入口），只列出、不再深入
+                    if (!seen.Add(k)) continue;
                 }
+
+                WalkNode nd;
+                nd.Path = s;
+                nd.Depth = cur.Depth + 1;
+                stack.Push(nd);
             }
 
-            string[] files = null;
-            try { files = Directory.GetFiles(dir); } catch { files = null; }
-            if (files == null) continue;
-            foreach (string f in files)
+            for (int i = 0; i < fs.Count; i++)
             {
-                string ext = Path.GetExtension(f);
+                Entry e = fs[i];
+                string ext = Path.GetExtension(e.Name);
                 if (string.IsNullOrEmpty(ext)) continue;
                 ext = ext.ToLowerInvariant();
-                if (!map.ContainsKey(ext)) continue;
+                string cat;
+                if (!map.TryGetValue(ext, out cat)) continue;
+
                 DocItem it = new DocItem();
-                it.Path = f;
-                it.Name = Path.GetFileName(f);
+                it.Path = Join(dir, e.Name);
+                it.Name = e.Name;
                 it.Ext = ext;
-                it.Cat = map[ext];
+                it.Cat = cat;
+                it.Size = ((long)e.SizeHigh << 32) | e.SizeLow;
                 try
                 {
-                    FileInfo fi = new FileInfo(f);
-                    it.Size = fi.Length;
-                    it.Modified = fi.LastWriteTime;
+                    long ft = ((long)e.WHigh << 32) | e.WLow;
+                    if (ft > 0) it.Modified = DateTime.FromFileTimeUtc(ft).ToLocalTime();
                 }
                 catch { }
                 res.Files.Add(it);
+
                 tick++;
                 if (progress != null && (tick % 500 == 0)) progress(res.Files.Count, res.Folders.Count);
             }
@@ -3858,7 +4039,7 @@ class MainForm : Form
                     {
                         BeginInvoke(new Action(delegate
                         {
-                            string s = "正在扫描… 已发现 " + files + " 个文件";
+                            string s = "正在扫描… 已发现 " + files + " 个文件 / " + dirs + " 个文件夹";
                             vDocs.State.Text = s;
                             vImages.State.Text = s;
                             vVideos.State.Text = s;
@@ -3883,6 +4064,15 @@ class MainForm : Form
                     vVideos.Dirty = true;
                     vArchives.Dirty = true;
                     vFolders.Dirty = true;
+                    if (res.Truncated)
+                    {
+                        string w = "已达扫描上限（" + res.Files.Count + " 文件 / " + res.Folders.Count + " 文件夹），结果不完整";
+                        vDocs.State.Text = w;
+                        vImages.State.Text = w;
+                        vVideos.State.Text = w;
+                        vArchives.State.Text = w;
+                        vFolders.State.Text = w;
+                    }
                     EnsureFillSelected();
                     finishDocScan();
                 }));
